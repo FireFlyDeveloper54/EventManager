@@ -1,6 +1,6 @@
 # EventManager
 
-Reflective Event System made for create minecraft client form scratch
+Reflective Event System
 
 ## Adding to your project:
 If you have not already, add Jitpack as a repository:
@@ -16,19 +16,21 @@ dependencies {
 }
 ```
 
-## Create Instance
+## Usage
+
+### Create Instance
 ```java
 EventManager eventManager = new EventManager();
 ```
 
-## Register
+### Register
 ```java
 Test test = new Test();
 eventManager.register(test); // register
 eventManager.unregister(test); // unregister
 ```
 
-## Call Event
+### Call Event
 ```java
 eventManager.call(new UpdateEvent());
 ```
