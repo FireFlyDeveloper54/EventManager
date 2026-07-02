@@ -2,9 +2,6 @@
 
 A fast, thread-safe, reflective event bus for general Java 8+ projects.
 
-This library has no Minecraft, game-client, or application-framework dependency. It is intended to be
-embedded in ordinary Java applications, tools, libraries, plugins, and services.
-
 ## Features
 
 - Annotation-driven handlers with `@EventTarget` and `@EventPriority`.
@@ -19,24 +16,6 @@ embedded in ordinary Java applications, tools, libraries, plugins, and services.
 - Listener objects can implement `EventSubscriber` to temporarily skip their own handlers.
 - Maintenance APIs: `hasListeners`, `handlerCount`, `listenerCount`, `isRegistered`, `removeEntry`, `cleanMap`, `clear`, and `unregisterAll`.
 - Fast invocation through cached `LambdaMetafactory` / `MethodHandle` invokers with reflection fallback.
-
-## Install
-
-Add JitPack:
-
-```groovy
-repositories {
-    maven { url 'https://jitpack.io' }
-}
-```
-
-Add the dependency:
-
-```groovy
-dependencies {
-    implementation 'com.github.cubk1:EventManager:-SNAPSHOT'
-}
-```
 
 ## Basic Usage
 
