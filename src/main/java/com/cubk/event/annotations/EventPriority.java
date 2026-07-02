@@ -6,10 +6,10 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Annotation used to specify the priority of an event handling method.
+ * Annotation used to specify the priority of an event handling method or field listener.
  */
 @Retention(RetentionPolicy.RUNTIME)
-@Target(ElementType.METHOD)
+@Target({ElementType.METHOD, ElementType.FIELD})
 public @interface EventPriority {
     /**
      * The priority value of the event handling method. Methods with lower values will be executed first.

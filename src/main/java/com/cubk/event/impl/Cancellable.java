@@ -19,4 +19,18 @@ public interface Cancellable {
      * @param state {@code true} to cancel the object, {@code false} to uncancel it.
      */
     void setCancelled(boolean state);
+
+    /**
+     * Marks this object as cancelled.
+     */
+    default void cancel() {
+        setCancelled(true);
+    }
+
+    /**
+     * Marks this object as not cancelled.
+     */
+    default void uncancel() {
+        setCancelled(false);
+    }
 }

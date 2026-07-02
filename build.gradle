@@ -12,9 +12,6 @@ repositories {
 
 sourceCompatibility = targetCompatibility = 1.8
 
-dependencies {
-}
-
 java {
     withSourcesJar()
 }
