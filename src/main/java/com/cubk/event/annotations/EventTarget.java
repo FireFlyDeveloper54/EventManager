@@ -8,4 +8,8 @@ import java.lang.annotation.*;
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.RUNTIME)
 public @interface EventTarget {
+    /**
+     * If true, this handler is skipped once a cancellable event has already been cancelled.
+     */
+    boolean ignoreCancelled() default false;
 }
