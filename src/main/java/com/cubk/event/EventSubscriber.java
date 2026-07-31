@@ -5,6 +5,9 @@ package com.cubk.event;
  * unregistering from the event manager.
  */
 public interface EventSubscriber {
+    /**
+     * @return {@code true} while this subscriber should receive events
+     */
     default boolean isHandlingEvents() {
         return true;
     }

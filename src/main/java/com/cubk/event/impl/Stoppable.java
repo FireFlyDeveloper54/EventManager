@@ -4,8 +4,14 @@ package com.cubk.event.impl;
  * Marks an event whose propagation can be stopped.
  */
 public interface Stoppable {
+    /**
+     * @return whether propagation has been stopped
+     */
     boolean isStopped();
 
+    /**
+     * @param state new stopped state
+     */
     void setStopped(boolean state);
 
     /**

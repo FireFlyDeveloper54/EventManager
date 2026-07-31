@@ -2,7 +2,8 @@ package com.cubk.event.impl;
 
 /**
  * An abstract class for cancellable events.
- * This class implements the {@link Event} and {@link Cancellable} interfaces.
+ * This class implements the {@link Event} and {@link Cancellable} interfaces while leaving the
+ * business meaning of cancellation to the event publisher.
  */
 public abstract class CancellableEvent implements Event, Cancellable {
 	/**

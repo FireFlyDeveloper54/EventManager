@@ -1,8 +1,11 @@
 package com.cubk.event.impl;
 
 /**
- * An interface for objects that can be cancelled.
- * Implementing classes can indicate whether they are cancelled or not using the provided methods.
+ * An interface for events carrying an application-defined cancellation result.
+ *
+ * <p>Cancellation commonly asks the event publisher to suppress an associated default action.
+ * The event manager only exposes the state to handlers and applies {@code ignoreCancelled}; it
+ * does not otherwise interpret what cancellation means for the application.
  */
 public interface Cancellable {
 
@@ -21,7 +24,8 @@ public interface Cancellable {
     void setCancelled(boolean state);
 
     /**
-     * Marks this object as cancelled.
+     * Marks this object as cancelled. The event publisher decides which default action, if any,
+     * should be suppressed as a result.
      */
     default void cancel() {
         setCancelled(true);
