@@ -1,5 +1,7 @@
 # EventManager
 
+[简体中文](README.zh-CN.md)
+
 A fast, thread-safe, reflective event bus for general Java 8+ projects.
 
 ## Features
@@ -337,31 +339,6 @@ overridable remain independent handlers.
 - Per-method invoker factories are cached.
 - Invocation prefers `LambdaMetafactory`, then `MethodHandle`, then reflection.
 - Registration order is stable when priorities are equal.
-
-## Integration Scope
-
-This version consolidates reusable ideas found in the other event systems in the surrounding
-projects:
-
-- Listener-owned priorities and direct listener registration.
-- Priorities directly on the main handler annotation, including first/last/monitor phases.
-- Type-safe registration of one listener for multiple declared event types.
-- Cached reflective member discovery for repeated registrations.
-- Exact-class dispatch alongside hierarchy dispatch.
-- Dispatch completion callbacks with once-per-event semantics.
-- Explicit subscription lifecycle and grouped unsubscription.
-- Correct handling of disabled subscribers, cancellation, stopping, static handlers, and failures.
-
-Minecraft-specific event classes, packet hooks, render/tick callbacks, Fabric/Forge annotations,
-client singletons, module-manager coupling, and game-thread assumptions are intentionally excluded.
-Cancellation remains an application-defined result flag and is distinct from stopping propagation:
-use `StoppableEvent` when event-bus dispatch itself must end immediately.
-
-Pre-created mutable event-instance registries were also excluded because sharing one event object
-across dispatches leaks state and conflicts with thread safety. The parent/child scoped dispatcher
-found in one module system was not merged into the core bus because it encodes that application's
-module topology rather than drop-in event semantics; separate `EventManager` instances remain
-independent and composable by application code.
 
 ## Source Embedding
 
