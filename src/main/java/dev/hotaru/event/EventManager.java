@@ -1,10 +1,9 @@
-package com.cubk.event;
+package dev.hotaru.event;
 
-import com.cubk.event.annotations.EventPriority;
-import com.cubk.event.annotations.EventTarget;
-import com.cubk.event.impl.Cancellable;
-import com.cubk.event.impl.Event;
-import com.cubk.event.impl.Stoppable;
+import dev.hotaru.event.annotations.EventTarget;
+import dev.hotaru.event.impl.Cancellable;
+import dev.hotaru.event.impl.Event;
+import dev.hotaru.event.impl.Stoppable;
 
 import java.lang.invoke.LambdaMetafactory;
 import java.lang.invoke.MethodHandle;
@@ -28,54 +27,32 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.logging.Level;
-import java.util.logging.Logger;
 
-/**
- * A thread-safe event bus supporting annotated handlers, field listeners, and functional listeners.
- *
- * <p>Features:
- * <ul>
- *     <li>Annotation driven handlers via {@link EventTarget} with {@link EventPriority} ordering
- *     (lower value runs first, ties broken by registration order).</li>
- *     <li>Functional registration: {@link #register(Class, Consumer)} returns a {@link Subscription}.</li>
- *     <li>{@link EventListener} instances can be registered directly or as annotated fields, and can
- *     provide their own default priority.</li>
- *     <li>Static-only registration of utility classes via {@link #register(Class)} - no instance needed.</li>
- *     <li>Handlers are discovered across the listener's whole class hierarchy (superclasses and interfaces).</li>
- *     <li>Listener class scan plans and method invoker factories are cached for cheap repeated registration.</li>
- *     <li>Events are dispatched to handlers registered for any supertype of the event
- *     (superclasses and interfaces), with optional exact-type dispatch and cached flattened arrays.</li>
- *     <li>Static and private handler methods are supported.</li>
- *     <li>Invocation goes through {@link LambdaMetafactory} when possible (using a private lookup on
- *     Java 9+ so even private handlers take the fast path), falling back to {@link MethodHandle} and
- *     finally plain reflection. Invoker factories are cached per method, so repeatedly registering and
- *     unregistering the same listener class or component is cheap.</li>
- *     <li>{@link Cancellable} events carry an application-defined cancellation result and can skip
- *     handlers marked {@code ignoreCancelled}; {@link Stoppable} events abort dispatch entirely.</li>
- *     <li>{@link EventSubscriber} listeners can temporarily opt out without unregistering.</li>
- *     <li>Lazy dispatch via {@link #call(Class, Supplier)} avoids constructing events nobody listens to.</li>
- *     <li>Handler exceptions are isolated and routed to a pluggable {@link EventErrorHandler}.</li>
- * </ul>
- */
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.EqualsAndHashCode;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
+import lombok.experimental.FieldDefaults;
+import lombok.extern.java.Log;
+
+@Log
 public class EventManager {
-    private static final Logger LOGGER = Logger.getLogger(EventManager.class.getName());
     private static final int DEFAULT_PRIORITY = Priority.NORMAL;
     private static final Handler[] NO_HANDLERS = new Handler[0];
     private static final MethodHandles.Lookup LOOKUP = MethodHandles.lookup();
-    // MethodHandles.privateLookupIn(Class, Lookup) only exists on Java 9+; resolved reflectively
-    // so the library still compiles and runs on Java 8.
+
     private static final Method PRIVATE_LOOKUP_IN = resolvePrivateLookupIn();
     private static final EventErrorHandler DEFAULT_ERROR_HANDLER = new EventErrorHandler() {
         @Override
         public void handle(Event event, Object listener, Throwable throwable) {
-            LOGGER.log(Level.SEVERE, "Failed to dispatch " + event.getClass().getName()
+            log.log(Level.SEVERE, "Failed to dispatch " + event.getClass().getName()
                     + " to listener " + listener, throwable);
         }
     };
@@ -90,34 +67,21 @@ public class EventManager {
         }
     };
 
-    private final Map<Class<? extends Event>, CopyOnWriteArrayList<Handler>> eventHandlers;
-    private final Map<Class<?>, CachedDispatch> dispatchCache;
-    private final Map<Method, InvokerFactory> invokerFactories;
-    private final Map<Class<?>, ListenerPlan> listenerPlans;
-    private final AtomicLong registrationOrder;
-    private final AtomicLong mutationVersion;
-    private volatile EventErrorHandler errorHandler;
+    private final Map<Class<? extends Event>, Handler[]> eventHandlers = new ConcurrentHashMap<Class<? extends Event>, Handler[]>();
+    private final Map<Class<?>, CachedDispatch> dispatchCache = new ConcurrentHashMap<Class<?>, CachedDispatch>();
+    private final Map<Method, InvokerFactory> invokerFactories = new ConcurrentHashMap<Method, InvokerFactory>();
+    private final Map<Class<?>, ListenerPlan> listenerPlans = new ConcurrentHashMap<Class<?>, ListenerPlan>();
+    private final AtomicLong registrationOrder = new AtomicLong();
+    private final AtomicLong mutationVersion = new AtomicLong();
+    private volatile EventErrorHandler errorHandler = DEFAULT_ERROR_HANDLER;
 
     public EventManager() {
-        this(DEFAULT_ERROR_HANDLER);
     }
 
     public EventManager(EventErrorHandler errorHandler) {
-        this.eventHandlers = new ConcurrentHashMap<Class<? extends Event>, CopyOnWriteArrayList<Handler>>();
-        this.dispatchCache = new ConcurrentHashMap<Class<?>, CachedDispatch>();
-        this.invokerFactories = new ConcurrentHashMap<Method, InvokerFactory>();
-        this.listenerPlans = new ConcurrentHashMap<Class<?>, ListenerPlan>();
-        this.registrationOrder = new AtomicLong();
-        this.mutationVersion = new AtomicLong();
         this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
     }
 
-    /**
-     * Replaces the handler invoked when a listener throws. Passing {@code null} restores the default
-     * (logging) behaviour.
-     *
-     * @param errorHandler replacement handler, or {@code null} for the default
-     */
     public void setErrorHandler(EventErrorHandler errorHandler) {
         this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
     }
@@ -132,16 +96,9 @@ public class EventManager {
     }
 
     public void register(Object listener) {
-        register(listener, null);
+        register(listener, (Class<? extends Event>) null);
     }
 
-    /**
-     * Registers only handlers of {@code listener} whose event type is exactly {@code eventClass}.
-     * A {@code null} eventClass registers every handler.
-     *
-     * @param listener listener object to scan
-     * @param eventClass exact handler event type, or {@code null} for all types
-     */
     public void register(Object listener, Class<? extends Event> eventClass) {
         if (listener == null) {
             return;
@@ -149,55 +106,39 @@ public class EventManager {
         bindListenerPlan(listener, listenerPlanFor(listener.getClass()), eventClass, false);
     }
 
-    /**
-     * Registers the <em>static</em> {@link EventTarget} methods and fields of {@code listenerClass} without needing
-     * an instance. Undo with {@link #unregister(Class)}.
-     *
-     * @param listenerClass class containing static handlers
-     */
     public void register(Class<?> listenerClass) {
+        register(listenerClass, (Class<? extends Event>) null);
+    }
+
+    public void register(Class<?> listenerClass, Class<? extends Event> eventClass) {
         if (listenerClass == null) {
             return;
         }
-        bindListenerPlan(listenerClass, listenerPlanFor(listenerClass), null, true);
+        bindListenerPlan(listenerClass, listenerPlanFor(listenerClass), eventClass, true);
     }
 
-    /**
-     * Registers a functional listener for events of exactly {@code eventType} (and its subtypes,
-     * through normal hierarchy dispatch) at {@link Priority#NORMAL}.
-     *
-     * @param eventType event type to register
-     * @param action listener action
-     * @param <T> event type
-     * @return a subscription used to remove this listener again
-     */
+    public void register(Object listener, Method method) {
+        if (listener == null || method == null) {
+            return;
+        }
+        bindMatchingDefinitions(listener, method, null, listener instanceof Class<?>);
+    }
+
+    public void register(Object listener, Field field) {
+        if (listener == null || field == null) {
+            return;
+        }
+        bindMatchingDefinitions(listener, null, field, listener instanceof Class<?>);
+    }
+
     public <T extends Event> Subscription register(Class<T> eventType, Consumer<? super T> action) {
         return register(eventType, DEFAULT_PRIORITY, false, action);
     }
 
-    /**
-     * Registers a functional listener with an explicit priority (lower runs first).
-     *
-     * @param eventType event type to register
-     * @param priority listener priority
-     * @param action listener action
-     * @param <T> event type
-     * @return a subscription used to remove this listener again
-     */
     public <T extends Event> Subscription register(Class<T> eventType, int priority, Consumer<? super T> action) {
         return register(eventType, priority, false, action);
     }
 
-    /**
-     * Registers a functional listener with an explicit priority and cancellation behaviour.
-     *
-     * @param eventType event type to register
-     * @param priority listener priority
-     * @param ignoreCancelled if true, the listener is skipped once a cancellable event has been cancelled
-     * @param action listener action
-     * @param <T> event type
-     * @return a subscription used to remove this listener again
-     */
     public <T extends Event> Subscription register(final Class<T> eventType, int priority,
                                                    boolean ignoreCancelled, final Consumer<? super T> action) {
         if (eventType == null || action == null) {
@@ -224,14 +165,6 @@ public class EventManager {
         return new HandlerSubscription(handler);
     }
 
-    /**
-     * Registers a typed listener directly, using {@link EventListener#getPriority()}.
-     *
-     * @param eventType event type to register
-     * @param listener typed listener
-     * @param <T> event type
-     * @return a subscription used to remove this listener again
-     */
     public <T extends Event> Subscription registerListener(Class<T> eventType,
                                                            EventListener<? super T> listener) {
         if (eventType == null || listener == null) {
@@ -240,30 +173,11 @@ public class EventManager {
         return registerListener(eventType, listener.getPriority(), false, listener);
     }
 
-    /**
-     * Registers a typed listener directly with an explicit priority.
-     *
-     * @param eventType event type to register
-     * @param priority listener priority
-     * @param listener typed listener
-     * @param <T> event type
-     * @return a subscription used to remove this listener again
-     */
     public <T extends Event> Subscription registerListener(Class<T> eventType, int priority,
                                                            EventListener<? super T> listener) {
         return registerListener(eventType, priority, false, listener);
     }
 
-    /**
-     * Registers a typed listener directly with explicit priority and cancellation behaviour.
-     *
-     * @param eventType event type to register
-     * @param priority listener priority
-     * @param ignoreCancelled whether cancelled events should be ignored
-     * @param listener typed listener
-     * @param <T> event type
-     * @return a subscription used to remove this listener again
-     */
     public <T extends Event> Subscription registerListener(final Class<T> eventType, int priority,
                                                            boolean ignoreCancelled,
                                                            final EventListener<? super T> listener) {
@@ -292,18 +206,6 @@ public class EventManager {
         return new HandlerSubscription(handler);
     }
 
-    /**
-     * Registers one typed listener for multiple event types, using
-     * {@link EventListener#getPriority()}.
-     *
-     * <p>The listener must be able to accept the common type {@code T} of every supplied event
-     * class. Duplicate and {@code null} event classes are ignored.
-     *
-     * @param listener typed listener
-     * @param eventTypes event types to register
-     * @param <T> common event type accepted by the listener
-     * @return grouped subscription for every unique event type
-     */
     @SafeVarargs
     public final <T extends Event> Subscription registerListener(
             EventListener<? super T> listener, Class<? extends T>... eventTypes) {
@@ -313,32 +215,12 @@ public class EventManager {
         return registerListener(listener.getPriority(), false, listener, eventTypes);
     }
 
-    /**
-     * Registers one typed listener for multiple event types with an explicit priority.
-     *
-     * @param priority listener priority
-     * @param listener typed listener
-     * @param eventTypes event types to register
-     * @param <T> common event type accepted by the listener
-     * @return grouped subscription for every unique event type
-     */
     @SafeVarargs
     public final <T extends Event> Subscription registerListener(
             int priority, EventListener<? super T> listener, Class<? extends T>... eventTypes) {
         return registerListener(priority, false, listener, eventTypes);
     }
 
-    /**
-     * Registers one typed listener for multiple event types with explicit priority and
-     * cancellation behaviour.
-     *
-     * @param priority listener priority
-     * @param ignoreCancelled whether cancelled events should be ignored
-     * @param listener typed listener
-     * @param eventTypes event types to register
-     * @param <T> common event type accepted by the listener
-     * @return grouped subscription for every unique event type
-     */
     @SafeVarargs
     public final <T extends Event> Subscription registerListener(
             int priority, boolean ignoreCancelled, EventListener<? super T> listener,
@@ -358,8 +240,45 @@ public class EventManager {
         return Subscriptions.combine(subscriptions.toArray(new Subscription[subscriptions.size()]));
     }
 
+    public Subscription subscribe(Object listener) {
+        if (listener == null) {
+            return Subscription.NOOP;
+        }
+        if (listener instanceof Class<?>) {
+            return subscribe((Class<?>) listener);
+        }
+        register(listener);
+        return isRegistered(listener) ? new ListenerSubscription(listener, null) : Subscription.NOOP;
+    }
+
+    public Subscription subscribe(Class<?> listenerClass) {
+        if (listenerClass == null) {
+            return Subscription.NOOP;
+        }
+        register(listenerClass);
+        return isRegistered(listenerClass) ? new ListenerSubscription(listenerClass, null) : Subscription.NOOP;
+    }
+
+    public Subscription subscribe(Object listener, Class<? extends Event> eventClass) {
+        if (listener == null || eventClass == null) {
+            return Subscription.NOOP;
+        }
+        if (listener instanceof Class<?>) {
+            register((Class<?>) listener, eventClass);
+        } else {
+            register(listener, eventClass);
+        }
+        return isRegistered(listener, eventClass)
+                ? new ListenerSubscription(listener, eventClass)
+                : Subscription.NOOP;
+    }
+
     public void unregister(final Object listener) {
         if (listener == null) {
+            return;
+        }
+        if (listener instanceof Class<?>) {
+            unregister((Class<?>) listener);
             return;
         }
         removeHandlers(new Predicate<Handler>() {
@@ -370,14 +289,12 @@ public class EventManager {
         });
     }
 
-    /**
-     * Unregisters only the handlers of {@code listener} that listen for exactly {@code eventClass}.
-     *
-     * @param listener listener object to remove
-     * @param eventClass exact event type to remove
-     */
     public void unregister(final Object listener, final Class<? extends Event> eventClass) {
         if (listener == null || eventClass == null) {
+            return;
+        }
+        if (listener instanceof Class<?>) {
+            unregister((Class<?>) listener, eventClass);
             return;
         }
         removeHandlers(new Predicate<Handler>() {
@@ -388,12 +305,30 @@ public class EventManager {
         });
     }
 
-    /**
-     * Unregisters every listener that is an instance of {@code listenerClass}, as well as static
-     * handlers registered through {@link #register(Class)} for that class.
-     *
-     * @param listenerClass listener base class or static handler class
-     */
+    public void unregister(final Object listener, final Method method) {
+        if (listener == null || method == null) {
+            return;
+        }
+        removeHandlers(new Predicate<Handler>() {
+            @Override
+            public boolean test(Handler handler) {
+                return handler.listener == listener && sameMethod(handler.method, method);
+            }
+        });
+    }
+
+    public void unregister(final Object listener, final Field field) {
+        if (listener == null || field == null) {
+            return;
+        }
+        removeHandlers(new Predicate<Handler>() {
+            @Override
+            public boolean test(Handler handler) {
+                return handler.listener == listener && sameField(handler.field, field);
+            }
+        });
+    }
+
     public void unregister(final Class<?> listenerClass) {
         if (listenerClass == null) {
             return;
@@ -401,6 +336,22 @@ public class EventManager {
         removeHandlers(new Predicate<Handler>() {
             @Override
             public boolean test(Handler handler) {
+                return handler.listener == listenerClass
+                        || listenerClass.isAssignableFrom(listenerClassOf(handler.listener));
+            }
+        });
+    }
+
+    public void unregister(final Class<?> listenerClass, final Class<? extends Event> eventClass) {
+        if (listenerClass == null || eventClass == null) {
+            return;
+        }
+        removeHandlers(new Predicate<Handler>() {
+            @Override
+            public boolean test(Handler handler) {
+                if (handler.eventType != eventClass) {
+                    return false;
+                }
                 return handler.listener == listenerClass
                         || listenerClass.isAssignableFrom(listenerClassOf(handler.listener));
             }
@@ -415,26 +366,6 @@ public class EventManager {
         }
     }
 
-    /**
-     * Removes every registered listener. Alias for {@link #clear()}.
-     */
-    public void unregisterAll() {
-        clear();
-    }
-
-    /**
-     * Removes every registered listener. Compatibility alias used by several event-bus APIs.
-     */
-    public void unregisterAllListeners() {
-        clear();
-    }
-
-    /**
-     * Removes all handlers registered exactly for {@code eventType}. Handlers registered for a
-     * supertype are left intact and will still receive subtype events.
-     *
-     * @param eventType exact event bucket to remove
-     */
     public void removeEntry(Class<? extends Event> eventType) {
         if (eventType == null) {
             return;
@@ -445,36 +376,6 @@ public class EventManager {
         }
     }
 
-    /**
-     * Cleans empty event buckets. Passing {@code false} clears the whole bus for compatibility with
-     * older event-bus APIs that exposed this method.
-     *
-     * @param onlyEmptyEntries whether to retain non-empty event buckets
-     */
-    public void cleanMap(boolean onlyEmptyEntries) {
-        if (!onlyEmptyEntries) {
-            clear();
-            return;
-        }
-
-        boolean removedAny = false;
-        for (Class<? extends Event> eventType : eventHandlers.keySet()) {
-            CopyOnWriteArrayList<Handler> removed = eventHandlers.computeIfPresent(eventType, (key, handlers) ->
-                    handlers.isEmpty() ? null : handlers);
-            if (removed == null) {
-                removedAny = true;
-            }
-        }
-        if (removedAny) {
-            dispatchCache.clear();
-            mutationVersion.incrementAndGet();
-        }
-    }
-
-    /**
-     * @param listener exact listener object to query
-     * @return true if this exact listener object has at least one registered handler
-     */
     public boolean isRegistered(Object listener) {
         if (listener == null) {
             return false;
@@ -482,9 +383,9 @@ public class EventManager {
         if (listener instanceof Class<?>) {
             return isRegistered((Class<?>) listener);
         }
-        for (CopyOnWriteArrayList<Handler> handlers : eventHandlers.values()) {
-            for (Handler handler : handlers) {
-                if (handler.listener == listener) {
+        for (Handler[] handlers : eventHandlers.values()) {
+            for (int i = 0; i < handlers.length; i++) {
+                if (handlers[i].listener == listener) {
                     return true;
                 }
             }
@@ -492,17 +393,40 @@ public class EventManager {
         return false;
     }
 
-    /**
-     * @param listenerClass listener base class or static handler class to query
-     * @return true if any registered listener is an instance of {@code listenerClass}, or if static
-     * handlers were registered for that class
-     */
+    public boolean isRegistered(Object listener, Class<? extends Event> eventClass) {
+        if (listener == null || eventClass == null) {
+            return false;
+        }
+        Handler[] handlers = eventHandlers.get(eventClass);
+        if (handlers == null) {
+            return false;
+        }
+        if (listener instanceof Class<?>) {
+            Class<?> listenerClass = (Class<?>) listener;
+            for (int i = 0; i < handlers.length; i++) {
+                Handler handler = handlers[i];
+                if (handler.listener == listenerClass
+                        || listenerClass.isAssignableFrom(listenerClassOf(handler.listener))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        for (int i = 0; i < handlers.length; i++) {
+            if (handlers[i].listener == listener) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public boolean isRegistered(Class<?> listenerClass) {
         if (listenerClass == null) {
             return false;
         }
-        for (CopyOnWriteArrayList<Handler> handlers : eventHandlers.values()) {
-            for (Handler handler : handlers) {
+        for (Handler[] handlers : eventHandlers.values()) {
+            for (int i = 0; i < handlers.length; i++) {
+                Handler handler = handlers[i];
                 if (handler.listener == listenerClass
                         || listenerClass.isAssignableFrom(listenerClassOf(handler.listener))) {
                     return true;
@@ -512,58 +436,36 @@ public class EventManager {
         return false;
     }
 
-    /**
-     * @return number of distinct listener objects/classes currently registered
-     */
     public int listenerCount() {
         Set<Object> listeners = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
-        for (CopyOnWriteArrayList<Handler> handlers : eventHandlers.values()) {
-            for (Handler handler : handlers) {
-                listeners.add(handler.listener);
+        for (Handler[] handlers : eventHandlers.values()) {
+            for (int i = 0; i < handlers.length; i++) {
+                listeners.add(handlers[i].listener);
             }
         }
         return listeners.size();
     }
 
-    /**
-     * @return total number of registered handlers across all event types
-     */
     public int handlerCount() {
         int count = 0;
-        for (CopyOnWriteArrayList<Handler> handlers : eventHandlers.values()) {
-            count += handlers.size();
+        for (Handler[] handlers : eventHandlers.values()) {
+            count += handlers.length;
         }
         return count;
     }
 
-    /**
-     * @param eventType runtime event type to query
-     * @return number of handlers that would receive an event of {@code eventType}
-     */
     public int handlerCount(Class<? extends Event> eventType) {
         return eventType == null ? 0 : handlersFor(eventType).length;
     }
 
-    /**
-     * @param eventType exact registered event type to query
-     * @return number of handlers registered exactly for {@code eventType}, excluding supertypes
-     */
     public int exactHandlerCount(Class<? extends Event> eventType) {
         return eventType == null ? 0 : exactHandlersFor(eventType).length;
     }
 
-    /**
-     * @param eventType runtime event type to query
-     * @return true if at least one handler would receive an event of the given type
-     */
     public boolean hasListeners(Class<? extends Event> eventType) {
         return eventType != null && handlersFor(eventType).length != 0;
     }
 
-    /**
-     * @param eventType exact registered event type to query
-     * @return true if at least one handler is registered exactly for the given type
-     */
     public boolean hasExactListeners(Class<? extends Event> eventType) {
         return eventType != null && exactHandlersFor(eventType).length != 0;
     }
@@ -582,15 +484,6 @@ public class EventManager {
         return event;
     }
 
-    /**
-     * Dispatches an event and invokes {@code afterDispatch} once after all eligible handlers finish.
-     * The callback also runs when no handlers are registered.
-     *
-     * @param event event to dispatch
-     * @param afterDispatch callback invoked after dispatch, or {@code null}
-     * @param <T> event type
-     * @return the supplied event, or {@code null} when the event is {@code null}
-     */
     public <T extends Event> T call(T event, Runnable afterDispatch) {
         if (event == null) {
             return null;
@@ -604,13 +497,6 @@ public class EventManager {
         }
     }
 
-    /**
-     * Dispatches only to handlers registered exactly for the event's runtime class.
-     *
-     * @param event event to dispatch
-     * @param <T> event type
-     * @return the supplied event, or {@code null} when the event is {@code null}
-     */
     public <T extends Event> T callExact(T event) {
         if (event == null) {
             return null;
@@ -623,14 +509,6 @@ public class EventManager {
         return event;
     }
 
-    /**
-     * Performs exact-type dispatch and invokes {@code afterDispatch} once afterwards.
-     *
-     * @param event event to dispatch
-     * @param afterDispatch callback invoked after dispatch, or {@code null}
-     * @param <T> event type
-     * @return the supplied event, or {@code null} when the event is {@code null}
-     */
     public <T extends Event> T callExact(T event, Runnable afterDispatch) {
         if (event == null) {
             return null;
@@ -644,61 +522,6 @@ public class EventManager {
         }
     }
 
-    /**
-     * Dispatches an event. Alias for {@link #call(Event)}.
-     *
-     * @param event event to dispatch
-     * @param <T> event type
-     * @return the supplied event
-     */
-    public <T extends Event> T post(T event) {
-        return call(event);
-    }
-
-    /**
-     * Dispatches an event and invokes a completion callback. Alias for {@link #call(Event, Runnable)}.
-     *
-     * @param event event to dispatch
-     * @param afterDispatch callback invoked after dispatch, or {@code null}
-     * @param <T> event type
-     * @return the supplied event
-     */
-    public <T extends Event> T post(T event, Runnable afterDispatch) {
-        return call(event, afterDispatch);
-    }
-
-    /**
-     * Dispatches an event. Alias for {@link #call(Event)}.
-     *
-     * @param event event to dispatch
-     * @param <T> event type
-     * @return the supplied event
-     */
-    public <T extends Event> T fire(T event) {
-        return call(event);
-    }
-
-    /**
-     * Dispatches an event and invokes a completion callback. Alias for {@link #call(Event, Runnable)}.
-     *
-     * @param event event to dispatch
-     * @param afterDispatch callback invoked after dispatch, or {@code null}
-     * @param <T> event type
-     * @return the supplied event
-     */
-    public <T extends Event> T fire(T event, Runnable afterDispatch) {
-        return call(event, afterDispatch);
-    }
-
-    /**
-     * Lazily constructs and dispatches an event: {@code supplier} is only invoked when at least one
-     * handler listens for {@code eventType}.
-     *
-     * @param eventType event type to query before construction
-     * @param supplier lazy event factory
-     * @param <T> event type
-     * @return the dispatched event, or {@code null} if nothing listens and no event was created
-     */
     public <T extends Event> T call(Class<T> eventType, Supplier<T> supplier) {
         if (eventType == null || supplier == null || !hasListeners(eventType)) {
             return null;
@@ -706,43 +529,11 @@ public class EventManager {
         return call(supplier.get());
     }
 
-    /**
-     * Lazily constructs and exactly dispatches an event.
-     *
-     * @param eventType exact event type to query before construction
-     * @param supplier lazy event factory
-     * @param <T> event type
-     * @return the dispatched event, or {@code null} if no exact listener exists
-     */
     public <T extends Event> T callExact(Class<T> eventType, Supplier<T> supplier) {
         if (eventType == null || supplier == null || !hasExactListeners(eventType)) {
             return null;
         }
         return callExact(supplier.get());
-    }
-
-    /**
-     * Lazily constructs and dispatches an event. Alias for {@link #call(Class, Supplier)}.
-     *
-     * @param eventType event type to query before construction
-     * @param supplier lazy event factory
-     * @param <T> event type
-     * @return the dispatched event, or {@code null} if nothing listens
-     */
-    public <T extends Event> T post(Class<T> eventType, Supplier<T> supplier) {
-        return call(eventType, supplier);
-    }
-
-    /**
-     * Lazily constructs and dispatches an event. Alias for {@link #call(Class, Supplier)}.
-     *
-     * @param eventType event type to query before construction
-     * @param supplier lazy event factory
-     * @param <T> event type
-     * @return the dispatched event, or {@code null} if nothing listens
-     */
-    public <T extends Event> T fire(Class<T> eventType, Supplier<T> supplier) {
-        return call(eventType, supplier);
     }
 
     private void dispatch(Event event, Handler[] handlers) {
@@ -770,7 +561,7 @@ public class EventManager {
                 try {
                     errorHandler.handle(event, handler.listener, t);
                 } catch (Throwable errorHandlerFailure) {
-                    LOGGER.log(Level.SEVERE, "Event error handler threw while handling a listener failure",
+                    log.log(Level.SEVERE, "Event error handler threw while handling a listener failure",
                             errorHandlerFailure);
                 }
             }
@@ -790,8 +581,8 @@ public class EventManager {
     }
 
     private Handler[] exactHandlersFor(Class<?> eventClass) {
-        List<Handler> handlers = eventHandlers.get(eventClass);
-        return handlers == null || handlers.isEmpty() ? NO_HANDLERS : handlers.toArray(NO_HANDLERS);
+        Handler[] handlers = eventHandlers.get(eventClass);
+        return handlers == null ? NO_HANDLERS : handlers;
     }
 
     private Handler[] buildDispatchList(Class<?> eventClass) {
@@ -845,31 +636,26 @@ public class EventManager {
             }
             descendants.add(method);
 
-            // An overriding declaration on a subtype shadows the inherited handler even when the
-            // override deliberately omits @EventTarget.
             if (shadowed || !method.isAnnotationPresent(EventTarget.class)) {
                 continue;
             }
             if (method.getParameterTypes().length != 1) {
-                LOGGER.warning("Skipping handler " + method + " because it must have exactly one parameter");
+                log.warning("Skipping handler " + method + " because it must have exactly one parameter");
                 continue;
             }
             if (method.getReturnType() != Void.TYPE) {
-                LOGGER.warning("Skipping handler " + method + " because handler methods must return void");
+                log.warning("Skipping handler " + method + " because handler methods must return void");
                 continue;
             }
 
             Class<?> parameterType = method.getParameterTypes()[0];
             if (!Event.class.isAssignableFrom(parameterType)) {
-                LOGGER.warning("Skipping handler " + method + " because parameter type is not an Event");
+                log.warning("Skipping handler " + method + " because parameter type is not an Event");
                 continue;
             }
 
             EventTarget eventTarget = method.getAnnotation(EventTarget.class);
-            EventPriority priorityAnnotation = method.getAnnotation(EventPriority.class);
-            int priority = priorityAnnotation != null
-                    ? priorityAnnotation.value()
-                    : annotationPriority(eventTarget, DEFAULT_PRIORITY);
+            int priority = annotationPriority(eventTarget, DEFAULT_PRIORITY);
             definitions.add(HandlerDefinition.forMethod(
                     method,
                     parameterType.asSubclass(Event.class),
@@ -883,24 +669,20 @@ public class EventManager {
                 continue;
             }
             if (!EventListener.class.isAssignableFrom(field.getType())) {
-                LOGGER.warning("Skipping listener field " + field + " because it is not an EventListener");
+                log.warning("Skipping listener field " + field + " because it is not an EventListener");
                 continue;
             }
 
             Class<? extends Event> fieldEventType = eventTypeFromField(field);
             if (fieldEventType == null) {
-                LOGGER.warning("Skipping listener field " + field
+                log.warning("Skipping listener field " + field
                         + " because its EventListener event type could not be inferred");
                 continue;
             }
 
             EventTarget eventTarget = field.getAnnotation(EventTarget.class);
-            EventPriority priorityAnnotation = field.getAnnotation(EventPriority.class);
-            boolean listenerPriority = priorityAnnotation == null
-                    && eventTarget.value() == Priority.UNSPECIFIED;
-            int priority = priorityAnnotation != null
-                    ? priorityAnnotation.value()
-                    : annotationPriority(eventTarget, DEFAULT_PRIORITY);
+            boolean listenerPriority = eventTarget.value() == Priority.UNSPECIFIED;
+            int priority = annotationPriority(eventTarget, DEFAULT_PRIORITY);
             definitions.add(HandlerDefinition.forField(
                     field,
                     fieldEventType,
@@ -940,8 +722,7 @@ public class EventManager {
         }
 
         if (!inheritedClass.isAssignableFrom(descendantClass)) {
-            // Two unrelated interfaces with the same signature still describe one effective
-            // listener method on an implementing class.
+
             return inheritedClass.isInterface() && descendantClass.isInterface();
         }
 
@@ -975,81 +756,102 @@ public class EventManager {
         return typePackage == null ? "" : typePackage.getName();
     }
 
+    private void bindMatchingDefinitions(Object listener, Method method, Field field, boolean staticOnly) {
+        ListenerPlan plan = listenerPlanFor(listener instanceof Class<?>
+                ? (Class<?>) listener
+                : listener.getClass());
+        for (int i = 0; i < plan.definitions.length; i++) {
+            HandlerDefinition definition = plan.definitions[i];
+            if (method != null) {
+                if (definition.method == null || !sameMethod(definition.method, method)) {
+                    continue;
+                }
+            } else if (field != null) {
+                if (definition.field == null || !sameField(definition.field, field)) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            bindDefinition(listener, definition, staticOnly);
+        }
+    }
+
     private void bindListenerPlan(Object listener, ListenerPlan plan, Class<? extends Event> eventClass,
                                   boolean staticOnly) {
         for (HandlerDefinition definition : plan.definitions) {
-            if (staticOnly && !definition.staticMember) {
-                continue;
-            }
             if (eventClass != null && definition.eventType != eventClass) {
                 continue;
             }
+            bindDefinition(listener, definition, staticOnly);
+        }
+    }
 
-            if (definition.method != null) {
-                Method method = definition.method;
-                Handler handler = new Handler(
-                        listener,
-                        method,
-                        null,
-                        definition.staticMember ? method.getDeclaringClass() : listener,
-                        definition.eventType,
-                        definition.priority,
-                        definition.ignoreCancelled,
-                        registrationOrder.getAndIncrement(),
-                        invokerFor(method, listener)
-                );
-                addHandler(handler);
-                continue;
-            }
+    private void bindDefinition(Object listener, HandlerDefinition definition, boolean staticOnly) {
+        if (staticOnly && !definition.staticMember) {
+            return;
+        }
 
-            Field field = definition.field;
-            EventListener<?> fieldListener = listenerFromField(listener, field);
-            if (fieldListener == null) {
-                continue;
-            }
-
-            final Class<? extends Event> dispatchType = definition.eventType;
-            final EventListener<?> dispatchListener = fieldListener;
-            int priority = definition.listenerPriority
-                    ? fieldListener.getPriority()
-                    : definition.priority;
-
+        if (definition.method != null) {
+            Method method = definition.method;
             Handler handler = new Handler(
                     listener,
+                    method,
                     null,
-                    field,
-                    definition.staticMember ? field.getDeclaringClass() : listener,
-                    dispatchType,
-                    priority,
+                    definition.staticMember ? method.getDeclaringClass() : listener,
+                    definition.eventType,
+                    definition.priority,
                     definition.ignoreCancelled,
                     registrationOrder.getAndIncrement(),
-                    new Invoker() {
-                        @SuppressWarnings({"unchecked", "rawtypes"})
-                        @Override
-                        public void invoke(Event event) {
-                            ((EventListener) dispatchListener).onEvent(dispatchType.cast(event));
-                        }
-                    }
+                    invokerFor(method, listener)
             );
             addHandler(handler);
+            return;
         }
+
+        Field field = definition.field;
+        EventListener<?> fieldListener = listenerFromField(listener, field);
+        if (fieldListener == null) {
+            return;
+        }
+
+        final Class<? extends Event> dispatchType = definition.eventType;
+        final EventListener<?> dispatchListener = fieldListener;
+        int priority = definition.listenerPriority
+                ? fieldListener.getPriority()
+                : definition.priority;
+
+        Handler handler = new Handler(
+                listener,
+                null,
+                field,
+                definition.staticMember ? field.getDeclaringClass() : listener,
+                dispatchType,
+                priority,
+                definition.ignoreCancelled,
+                registrationOrder.getAndIncrement(),
+                new Invoker() {
+                    @SuppressWarnings({"unchecked", "rawtypes"})
+                    @Override
+                    public void invoke(Event event) {
+                        ((EventListener) dispatchListener).onEvent(dispatchType.cast(event));
+                    }
+                }
+        );
+        addHandler(handler);
     }
 
     private void addHandler(final Handler handler) {
         final boolean[] added = new boolean[1];
-        eventHandlers.compute(handler.eventType, (key, existing) -> {
-            CopyOnWriteArrayList<Handler> handlers = existing != null
-                    ? existing
-                    : new CopyOnWriteArrayList<Handler>();
-            if (!handlers.contains(handler)) {
-                int index = 0;
-                while (index < handlers.size() && HANDLER_ORDER.compare(handlers.get(index), handler) <= 0) {
-                    index++;
+        eventHandlers.compute(handler.eventType, new java.util.function.BiFunction<Class<? extends Event>, Handler[], Handler[]>() {
+            @Override
+            public Handler[] apply(Class<? extends Event> key, Handler[] existing) {
+                Handler[] updated = insertHandler(existing, handler);
+                if (updated != existing) {
+                    added[0] = true;
                 }
-                handlers.add(index, handler);
-                added[0] = true;
+                return updated;
             }
-            return handlers;
         });
         if (added[0]) {
             mutationVersion.incrementAndGet();
@@ -1059,11 +861,15 @@ public class EventManager {
     private void removeHandlers(final Predicate<Handler> predicate) {
         final boolean[] removed = new boolean[1];
         for (Class<? extends Event> eventType : eventHandlers.keySet()) {
-            eventHandlers.computeIfPresent(eventType, (key, handlers) -> {
-                if (handlers.removeIf(predicate)) {
-                    removed[0] = true;
+            eventHandlers.computeIfPresent(eventType, new java.util.function.BiFunction<Class<? extends Event>, Handler[], Handler[]>() {
+                @Override
+                public Handler[] apply(Class<? extends Event> key, Handler[] handlers) {
+                    Handler[] updated = removeMatching(handlers, predicate);
+                    if (updated != handlers) {
+                        removed[0] = true;
+                    }
+                    return updated.length == 0 ? null : updated;
                 }
-                return handlers.isEmpty() ? null : handlers;
             });
         }
         if (removed[0]) {
@@ -1079,9 +885,11 @@ public class EventManager {
 
         @SuppressWarnings("unchecked")
         Class<? extends Event> eventType = (Class<? extends Event>) type;
-        List<Handler> handlers = eventHandlers.get(eventType);
+        Handler[] handlers = eventHandlers.get(eventType);
         if (handlers != null) {
-            collected.addAll(handlers);
+            for (int i = 0; i < handlers.length; i++) {
+                collected.add(handlers[i]);
+            }
         }
 
         for (Class<?> iface : type.getInterfaces()) {
@@ -1092,26 +900,33 @@ public class EventManager {
 
     private EventListener<?> listenerFromField(Object listener, Field field) {
         boolean isStatic = Modifier.isStatic(field.getModifiers());
+        boolean wasAccessible = field.isAccessible();
         try {
             field.setAccessible(true);
         } catch (SecurityException ignored) {
-            // Fall through: public fields can still be read.
+
         }
 
         try {
             Object value = field.get(isStatic ? null : listener);
             if (value == null) {
-                LOGGER.warning("Skipping listener field " + field + " because its value is null");
+                log.warning("Skipping listener field " + field + " because its value is null");
                 return null;
             }
             if (!(value instanceof EventListener<?>)) {
-                LOGGER.warning("Skipping listener field " + field + " because its value is not an EventListener");
+                log.warning("Skipping listener field " + field + " because its value is not an EventListener");
                 return null;
             }
             return (EventListener<?>) value;
         } catch (IllegalAccessException e) {
-            LOGGER.log(Level.WARNING, "Skipping listener field " + field + " because it is not accessible", e);
+            log.log(Level.WARNING, "Skipping listener field " + field + " because it is not accessible", e);
             return null;
+        } finally {
+            try {
+                field.setAccessible(wasAccessible);
+            } catch (SecurityException ignored) {
+
+            }
         }
     }
 
@@ -1161,6 +976,71 @@ public class EventManager {
         return listener instanceof Class<?> ? (Class<?>) listener : listener.getClass();
     }
 
+    private static boolean sameMethod(Method left, Method right) {
+        if (left == null || right == null) {
+            return false;
+        }
+        if (left.equals(right)) {
+            return true;
+        }
+        return left.getName().equals(right.getName())
+                && java.util.Arrays.equals(left.getParameterTypes(), right.getParameterTypes());
+    }
+
+    private static boolean sameField(Field left, Field right) {
+        if (left == null || right == null) {
+            return false;
+        }
+        if (left.equals(right)) {
+            return true;
+        }
+        return left.getName().equals(right.getName()) && left.getType() == right.getType();
+    }
+
+    private static Handler[] insertHandler(Handler[] current, Handler handler) {
+        Handler[] handlers = current == null ? NO_HANDLERS : current;
+        for (int i = 0; i < handlers.length; i++) {
+            if (handlers[i].equals(handler)) {
+                return handlers;
+            }
+        }
+
+        int index = 0;
+        while (index < handlers.length && HANDLER_ORDER.compare(handlers[index], handler) <= 0) {
+            index++;
+        }
+
+        Handler[] updated = new Handler[handlers.length + 1];
+        System.arraycopy(handlers, 0, updated, 0, index);
+        updated[index] = handler;
+        System.arraycopy(handlers, index, updated, index + 1, handlers.length - index);
+        return updated;
+    }
+
+    private static Handler[] removeMatching(Handler[] handlers, Predicate<Handler> predicate) {
+        int remaining = 0;
+        for (int i = 0; i < handlers.length; i++) {
+            if (!predicate.test(handlers[i])) {
+                remaining++;
+            }
+        }
+        if (remaining == handlers.length) {
+            return handlers;
+        }
+        if (remaining == 0) {
+            return NO_HANDLERS;
+        }
+
+        Handler[] updated = new Handler[remaining];
+        int index = 0;
+        for (int i = 0; i < handlers.length; i++) {
+            if (!predicate.test(handlers[i])) {
+                updated[index++] = handlers[i];
+            }
+        }
+        return updated;
+    }
+
     private Invoker invokerFor(Method method, Object listener) {
         InvokerFactory factory = invokerFactories.computeIfAbsent(method, new java.util.function.Function<Method, InvokerFactory>() {
             @Override
@@ -1171,23 +1051,17 @@ public class EventManager {
         return factory.create(listener);
     }
 
-    /**
-     * Builds a per-method factory of invokers so the expensive lookup / lambda generation runs once
-     * per method, no matter how many instances register or how often they toggle.
-     */
     private static InvokerFactory buildInvokerFactory(final Method method) {
         final boolean isStatic = Modifier.isStatic(method.getModifiers());
 
         try {
             method.setAccessible(true);
         } catch (SecurityException ignored) {
-            // Fall through: accessible handlers can still work without this.
+
         }
 
         MethodHandles.Lookup lookup = lookupFor(method.getDeclaringClass());
 
-        // Fastest path: compile the handler into a Consumer via LambdaMetafactory. With a private
-        // lookup (Java 9+) this covers private handlers too; otherwise fall back below.
         try {
             MethodHandle target = lookup.unreflect(method);
             MethodType invokedType = isStatic
@@ -1237,16 +1111,18 @@ public class EventManager {
                 }
             };
         } catch (Throwable ignored) {
-            // Fall through to MethodHandle.
+
         }
 
         try {
             final MethodHandle handle = lookup.unreflect(method);
             if (isStatic) {
+                final MethodHandle adapted = handle.asType(MethodType.methodType(void.class, Event.class));
                 final Invoker invoker = new Invoker() {
                     @Override
-                    public void invoke(Event event) throws Throwable {
-                        handle.invoke(event);
+                    @SneakyThrows
+                    public void invoke(Event event) {
+                        adapted.invokeExact(event);
                     }
                 };
                 return new InvokerFactory() {
@@ -1259,17 +1135,19 @@ public class EventManager {
             return new InvokerFactory() {
                 @Override
                 public Invoker create(Object listener) {
-                    final MethodHandle bound = handle.bindTo(listener);
+                    final MethodHandle bound = handle.bindTo(listener)
+                            .asType(MethodType.methodType(void.class, Event.class));
                     return new Invoker() {
                         @Override
-                        public void invoke(Event event) throws Throwable {
-                            bound.invoke(event);
+                        @SneakyThrows
+                        public void invoke(Event event) {
+                            bound.invokeExact(event);
                         }
                     };
                 }
             };
         } catch (IllegalAccessException ignored) {
-            // Fall through to reflection.
+
         }
 
         return new InvokerFactory() {
@@ -1283,7 +1161,8 @@ public class EventManager {
     private static Invoker reflectiveInvoker(final Method method, final Object listener, final boolean isStatic) {
         return new Invoker() {
             @Override
-            public void invoke(Event event) throws Throwable {
+            @SneakyThrows
+            public void invoke(Event event) {
                 try {
                     method.invoke(isStatic ? null : listener, event);
                 } catch (InvocationTargetException invocationFailure) {
@@ -1294,6 +1173,7 @@ public class EventManager {
         };
     }
 
+    @SneakyThrows
     private static Method resolvePrivateLookupIn() {
         try {
             return MethodHandles.class.getMethod("privateLookupIn", Class.class, MethodHandles.Lookup.class);
@@ -1302,12 +1182,12 @@ public class EventManager {
         }
     }
 
+    @SneakyThrows
     private static MethodHandles.Lookup lookupFor(Class<?> declaringClass) {
         if (PRIVATE_LOOKUP_IN != null) {
             try {
                 return (MethodHandles.Lookup) PRIVATE_LOOKUP_IN.invoke(null, declaringClass, LOOKUP);
             } catch (Throwable ignored) {
-                // Inaccessible module etc.; the plain lookup still handles public handlers.
             }
         }
         return LOOKUP;
@@ -1321,13 +1201,10 @@ public class EventManager {
         Invoker create(Object listener);
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private final class HandlerSubscription implements Subscription {
         private final Handler handler;
         private final AtomicBoolean subscribed = new AtomicBoolean(true);
-
-        private HandlerSubscription(Handler handler) {
-            this.handler = handler;
-        }
 
         @Override
         public void unsubscribe() {
@@ -1347,12 +1224,12 @@ public class EventManager {
             if (!subscribed.get()) {
                 return false;
             }
-            List<Handler> handlers = eventHandlers.get(handler.eventType);
+            Handler[] handlers = eventHandlers.get(handler.eventType);
             if (handlers == null) {
                 return false;
             }
-            for (Handler candidate : handlers) {
-                if (candidate == handler) {
+            for (int i = 0; i < handlers.length; i++) {
+                if (handlers[i] == handler) {
                     return true;
                 }
             }
@@ -1360,34 +1237,51 @@ public class EventManager {
         }
     }
 
-    private static final class ListenerPlan {
-        private final HandlerDefinition[] definitions;
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
+    private final class ListenerSubscription implements Subscription {
+        private final Object listener;
+        private final Class<? extends Event> eventClass;
+        private final AtomicBoolean subscribed = new AtomicBoolean(true);
 
-        private ListenerPlan(HandlerDefinition[] definitions) {
-            this.definitions = definitions;
+        @Override
+        public void unsubscribe() {
+            if (!subscribed.compareAndSet(true, false)) {
+                return;
+            }
+            if (eventClass == null) {
+                EventManager.this.unregister(listener);
+            } else {
+                EventManager.this.unregister(listener, eventClass);
+            }
+        }
+
+        @Override
+        public boolean isSubscribed() {
+            if (!subscribed.get()) {
+                return false;
+            }
+            return eventClass == null
+                    ? EventManager.this.isRegistered(listener)
+                    : EventManager.this.isRegistered(listener, eventClass);
         }
     }
 
-    private static final class HandlerDefinition {
-        private final Method method;
-        private final Field field;
-        private final Class<? extends Event> eventType;
-        private final int priority;
-        private final boolean listenerPriority;
-        private final boolean ignoreCancelled;
-        private final boolean staticMember;
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
+    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
+    private static final class ListenerPlan {
+        HandlerDefinition[] definitions;
+    }
 
-        private HandlerDefinition(Method method, Field field, Class<? extends Event> eventType,
-                                  int priority, boolean listenerPriority, boolean ignoreCancelled,
-                                  boolean staticMember) {
-            this.method = method;
-            this.field = field;
-            this.eventType = eventType;
-            this.priority = priority;
-            this.listenerPriority = listenerPriority;
-            this.ignoreCancelled = ignoreCancelled;
-            this.staticMember = staticMember;
-        }
+    @AllArgsConstructor(access = AccessLevel.PRIVATE)
+    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
+    private static final class HandlerDefinition {
+        Method method;
+        Field field;
+        Class<? extends Event> eventType;
+        int priority;
+        boolean listenerPriority;
+        boolean ignoreCancelled;
+        boolean staticMember;
 
         private static HandlerDefinition forMethod(Method method, Class<? extends Event> eventType,
                                                    int priority, boolean ignoreCancelled) {
@@ -1417,40 +1311,25 @@ public class EventManager {
         }
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
+    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
     private static final class CachedDispatch {
-        private final long version;
-        private final Handler[] handlers;
-
-        private CachedDispatch(long version, Handler[] handlers) {
-            this.version = version;
-            this.handlers = handlers;
-        }
+        long version;
+        Handler[] handlers;
     }
 
+    @AllArgsConstructor(access = AccessLevel.PRIVATE)
+    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
     private static final class Handler {
-        private final Object listener;
-        private final Method method;
-        private final Field field;
-        private final Object dedupeOwner;
-        private final Class<? extends Event> eventType;
-        private final int priority;
-        private final boolean ignoreCancelled;
-        private final long order;
-        private final Invoker invoker;
-
-        private Handler(Object listener, Method method, Field field, Object dedupeOwner,
-                        Class<? extends Event> eventType, int priority, boolean ignoreCancelled,
-                        long order, Invoker invoker) {
-            this.listener = listener;
-            this.method = method;
-            this.field = field;
-            this.dedupeOwner = dedupeOwner;
-            this.eventType = eventType;
-            this.priority = priority;
-            this.ignoreCancelled = ignoreCancelled;
-            this.order = order;
-            this.invoker = invoker;
-        }
+        Object listener;
+        Method method;
+        Field field;
+        Object dedupeOwner;
+        Class<? extends Event> eventType;
+        int priority;
+        boolean ignoreCancelled;
+        long order;
+        Invoker invoker;
 
         private void invoke(Event event) throws Throwable {
             invoker.invoke(event);
@@ -1469,8 +1348,6 @@ public class EventManager {
                 return false;
             }
             Handler other = (Handler) obj;
-            // Direct functional registrations have no reflective member and may be registered
-            // multiple times deliberately.
             if (method == null && field == null) {
                 return false;
             }
@@ -1496,32 +1373,15 @@ public class EventManager {
         }
     }
 
+    @EqualsAndHashCode
+    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
     private static final class MethodSignature {
-        private final String name;
-        private final Class<?>[] parameterTypes;
-        private final int hashCode;
+        String name;
+        Class<?>[] parameterTypes;
 
         private MethodSignature(Method method) {
             this.name = method.getName();
             this.parameterTypes = method.getParameterTypes();
-            this.hashCode = 31 * name.hashCode() + java.util.Arrays.hashCode(parameterTypes);
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (this == obj) {
-                return true;
-            }
-            if (!(obj instanceof MethodSignature)) {
-                return false;
-            }
-            MethodSignature other = (MethodSignature) obj;
-            return name.equals(other.name) && java.util.Arrays.equals(parameterTypes, other.parameterTypes);
-        }
-
-        @Override
-        public int hashCode() {
-            return hashCode;
         }
     }
 }

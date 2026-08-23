@@ -3,7 +3,7 @@ plugins {
     id 'maven-publish'
 }
 
-group = 'com.cubk'
+group = 'dev.hotaru'
 version = 'snapshot'
 
 repositories {
@@ -11,6 +11,10 @@ repositories {
 }
 
 dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.38'
+    annotationProcessor 'org.projectlombok:lombok:1.18.38'
+    testCompileOnly 'org.projectlombok:lombok:1.18.38'
+    testAnnotationProcessor 'org.projectlombok:lombok:1.18.38'
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.3'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.3'
 }
@@ -25,7 +29,6 @@ java {
 }
 
 def testJavaVersion = providers.gradleProperty('testJavaVersion').orElse('8')
-def embeddedClasses = layout.buildDirectory.dir('classes/sourceEmbedding')
 
 test {
     useJUnitPlatform()
@@ -33,38 +36,6 @@ test {
         languageVersion = JavaLanguageVersion.of(testJavaVersion.get().toInteger())
     }
 }
-
-tasks.register('compileSourceEmbeddingExample', JavaCompile) {
-    group = 'verification'
-    description = 'Compiles the raw EventManager sources with the zero-dependency embedding example.'
-    source = files(
-            fileTree('src/main/java') {
-                include '**/*.java'
-            },
-            file('examples/source-embedding/EmbeddedUsage.java')
-    )
-    classpath = files()
-    destinationDirectory = embeddedClasses
-    javaCompiler = javaToolchains.compilerFor {
-        languageVersion = JavaLanguageVersion.of(8)
-    }
-    sourceCompatibility = '8'
-    targetCompatibility = '8'
-    options.encoding = 'UTF-8'
-}
-
-tasks.register('runSourceEmbeddingExample', JavaExec) {
-    group = 'verification'
-    description = 'Runs the source-embedding example on the selected test JVM.'
-    dependsOn 'compileSourceEmbeddingExample'
-    classpath = files(embeddedClasses)
-    mainClass = 'example.EmbeddedUsage'
-    javaLauncher = javaToolchains.launcherFor {
-        languageVersion = JavaLanguageVersion.of(testJavaVersion.get().toInteger())
-    }
-}
-
-check.dependsOn 'runSourceEmbeddingExample'
 
 publishing {
     publications {
