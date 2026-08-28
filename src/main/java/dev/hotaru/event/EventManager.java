@@ -103,6 +103,10 @@ public class EventManager {
         if (listener == null) {
             return;
         }
+        if (listener instanceof Class<?>) {
+            register((Class<?>) listener, eventClass);
+            return;
+        }
         bindListenerPlan(listener, listenerPlanFor(listener.getClass()), eventClass, false);
     }
 
@@ -132,6 +136,11 @@ public class EventManager {
     }
 
     public <T extends Event> Subscription register(Class<T> eventType, Consumer<? super T> action) {
+        if (action instanceof EventListener<?>) {
+            @SuppressWarnings("unchecked")
+            EventListener<? super T> listener = (EventListener<? super T>) action;
+            return registerListener(eventType, listener);
+        }
         return register(eventType, DEFAULT_PRIORITY, false, action);
     }
 
@@ -151,7 +160,7 @@ public class EventManager {
                 null,
                 null,
                 eventType,
-                priority,
+                normalizePriority(priority),
                 ignoreCancelled,
                 registrationOrder.getAndIncrement(),
                 new Invoker() {
@@ -191,7 +200,7 @@ public class EventManager {
                 null,
                 null,
                 eventType,
-                priority,
+                normalizePriority(priority),
                 ignoreCancelled,
                 registrationOrder.getAndIncrement(),
                 new Invoker() {
@@ -359,9 +368,12 @@ public class EventManager {
     }
 
     public void clear() {
-        if (!eventHandlers.isEmpty() || !dispatchCache.isEmpty()) {
-            eventHandlers.clear();
-            dispatchCache.clear();
+        boolean hadRegistrations = !eventHandlers.isEmpty() || !dispatchCache.isEmpty();
+        eventHandlers.clear();
+        dispatchCache.clear();
+        listenerPlans.clear();
+        invokerFactories.clear();
+        if (hadRegistrations) {
             mutationVersion.incrementAndGet();
         }
     }
@@ -543,28 +555,57 @@ public class EventManager {
         for (int i = 0; i < handlers.length; i++) {
             Handler handler = handlers[i];
 
-            if (stoppable != null && stoppable.isStopped()) {
-                break;
+            if (stoppable != null) {
+                boolean stopped;
+                try {
+                    stopped = stoppable.isStopped();
+                } catch (Throwable t) {
+                    reportFailure(event, event, t);
+                    return;
+                }
+                if (stopped) {
+                    break;
+                }
             }
 
-            if (!handler.isHandlingEvents()) {
+            boolean handling;
+            try {
+                handling = handler.isHandlingEvents();
+            } catch (Throwable t) {
+                reportFailure(event, handler.listener, t);
+                continue;
+            }
+            if (!handling) {
                 continue;
             }
 
-            if (cancellable != null && cancellable.isCancelled() && handler.ignoreCancelled) {
-                continue;
+            if (cancellable != null && handler.ignoreCancelled) {
+                boolean cancelled;
+                try {
+                    cancelled = cancellable.isCancelled();
+                } catch (Throwable t) {
+                    reportFailure(event, event, t);
+                    return;
+                }
+                if (cancelled) {
+                    continue;
+                }
             }
 
             try {
                 handler.invoke(event);
             } catch (Throwable t) {
-                try {
-                    errorHandler.handle(event, handler.listener, t);
-                } catch (Throwable errorHandlerFailure) {
-                    log.log(Level.SEVERE, "Event error handler threw while handling a listener failure",
-                            errorHandlerFailure);
-                }
+                reportFailure(event, handler.listener, t);
             }
+        }
+    }
+
+    private void reportFailure(Event event, Object source, Throwable throwable) {
+        try {
+            errorHandler.handle(event, source, throwable);
+        } catch (Throwable errorHandlerFailure) {
+            log.log(Level.SEVERE, "Event error handler threw while handling a listener failure",
+                    errorHandlerFailure);
         }
     }
 
@@ -702,6 +743,10 @@ public class EventManager {
         return eventTarget.value() != Priority.UNSPECIFIED ? eventTarget.value() : fallback;
     }
 
+    private static int normalizePriority(int priority) {
+        return priority == Priority.UNSPECIFIED ? DEFAULT_PRIORITY : priority;
+    }
+
     private static boolean isShadowedBy(Method inheritedMethod, List<Method> descendants) {
         if (descendants == null) {
             return false;
@@ -800,7 +845,7 @@ public class EventManager {
                     null,
                     definition.staticMember ? method.getDeclaringClass() : listener,
                     definition.eventType,
-                    definition.priority,
+                    normalizePriority(definition.priority),
                     definition.ignoreCancelled,
                     registrationOrder.getAndIncrement(),
                     invokerFor(method, listener)
@@ -827,7 +872,7 @@ public class EventManager {
                 field,
                 definition.staticMember ? field.getDeclaringClass() : listener,
                 dispatchType,
-                priority,
+                normalizePriority(priority),
                 definition.ignoreCancelled,
                 registrationOrder.getAndIncrement(),
                 new Invoker() {

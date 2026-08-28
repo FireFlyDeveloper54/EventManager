@@ -13,6 +13,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -267,6 +268,60 @@ class EventManagerTest {
     }
 
     @Test
+    void classArrivingThroughObjectParameterStillBindsStaticHandlers() {
+        EventManager events = new EventManager();
+        StaticHandlers.getPings().set(0);
+        Object asObject = StaticHandlers.class;
+
+        events.register(asObject);
+        events.call(new Ping());
+
+        assertEquals(1, StaticHandlers.getPings().get());
+        assertTrue(events.isRegistered(StaticHandlers.class));
+    }
+
+    @Test
+    void varargsRegistrationBindsEveryClass() {
+        EventManager events = new EventManager();
+        StaticHandlers.getPings().set(0);
+        MoreStaticHandlers.getPings().set(0);
+
+        events.register(StaticHandlers.class, MoreStaticHandlers.class);
+        events.call(new Ping());
+
+        assertEquals(1, StaticHandlers.getPings().get());
+        assertEquals(1, MoreStaticHandlers.getPings().get());
+    }
+
+    @Test
+    void clearReleasesScanCachesAndStaysUsable() throws Exception {
+        EventManager events = new EventManager();
+        events.register(new CountingListener());
+        events.register(new FieldListener());
+        events.call(new Ping());
+
+        assertFalse(cacheOf(events, "listenerPlans").isEmpty());
+        assertFalse(cacheOf(events, "invokerFactories").isEmpty());
+
+        events.clear();
+
+        assertEquals(0, events.handlerCount());
+        assertTrue(cacheOf(events, "listenerPlans").isEmpty());
+        assertTrue(cacheOf(events, "invokerFactories").isEmpty());
+
+        CountingListener rebound = new CountingListener();
+        events.register(rebound);
+        events.call(new Ping());
+        assertEquals(1, rebound.getPings());
+    }
+
+    private static Map<?, ?> cacheOf(EventManager events, String name) throws Exception {
+        Field field = EventManager.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return (Map<?, ?>) field.get(events);
+    }
+
+    @Test
     void lazySupplierIsNotInvokedWithoutListeners() {
         EventManager events = new EventManager();
         AtomicBoolean created = new AtomicBoolean();
@@ -431,6 +486,16 @@ class EventManagerTest {
     }
 
     public static final class StaticHandlers {
+        @Getter
+        private static final AtomicInteger pings = new AtomicInteger();
+
+        @EventTarget
+        public static void onPing(Ping event) {
+            pings.incrementAndGet();
+        }
+    }
+
+    public static final class MoreStaticHandlers {
         @Getter
         private static final AtomicInteger pings = new AtomicInteger();
 
