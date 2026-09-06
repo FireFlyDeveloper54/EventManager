@@ -48,8 +48,26 @@ public class Subscriptions {
             if (!subscribed.compareAndSet(true, false)) {
                 return;
             }
+            Throwable firstFailure = null;
             for (Subscription subscription : subscriptions) {
-                subscription.unsubscribe();
+                try {
+                    subscription.unsubscribe();
+                } catch (Throwable failure) {
+                    if (firstFailure == null) {
+                        firstFailure = failure;
+                    } else {
+                        firstFailure.addSuppressed(failure);
+                    }
+                }
+            }
+            if (firstFailure instanceof RuntimeException) {
+                throw (RuntimeException) firstFailure;
+            }
+            if (firstFailure instanceof Error) {
+                throw (Error) firstFailure;
+            }
+            if (firstFailure != null) {
+                throw new IllegalStateException("Subscription cleanup failed", firstFailure);
             }
         }
 

@@ -15,8 +15,10 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -27,6 +29,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -43,7 +48,7 @@ import lombok.experimental.FieldDefaults;
 import lombok.extern.java.Log;
 
 @Log
-public class EventManager {
+public class EventManager implements AutoCloseable {
     private static final int DEFAULT_PRIORITY = Priority.NORMAL;
     private static final Handler[] NO_HANDLERS = new Handler[0];
     private static final MethodHandles.Lookup LOOKUP = MethodHandles.lookup();
@@ -66,14 +71,60 @@ public class EventManager {
             return Long.compare(left.order, right.order);
         }
     };
-
+    private static final Comparator<Method> METHOD_SCAN_ORDER = new Comparator<Method>() {
+        @Override
+        public int compare(Method left, Method right) {
+            int result = left.getName().compareTo(right.getName());
+            if (result != 0) return result;
+            Class<?>[] leftParameters = left.getParameterTypes();
+            Class<?>[] rightParameters = right.getParameterTypes();
+            result = Integer.compare(leftParameters.length, rightParameters.length);
+            for (int i = 0; result == 0 && i < leftParameters.length; i++) {
+                result = leftParameters[i].getName().compareTo(rightParameters[i].getName());
+            }
+            if (result != 0) return result;
+            return left.getReturnType().getName().compareTo(right.getReturnType().getName());
+        }
+    };
+    private static final Comparator<Field> FIELD_SCAN_ORDER = new Comparator<Field>() {
+        @Override
+        public int compare(Field left, Field right) {
+            int result = left.getName().compareTo(right.getName());
+            return result != 0 ? result : left.getType().getName().compareTo(right.getType().getName());
+        }
+    };
     private final Map<Class<? extends Event>, Handler[]> eventHandlers = new ConcurrentHashMap<Class<? extends Event>, Handler[]>();
-    private final Map<Class<?>, CachedDispatch> dispatchCache = new ConcurrentHashMap<Class<?>, CachedDispatch>();
-    private final Map<Method, InvokerFactory> invokerFactories = new ConcurrentHashMap<Method, InvokerFactory>();
-    private final Map<Class<?>, ListenerPlan> listenerPlans = new ConcurrentHashMap<Class<?>, ListenerPlan>();
+    private final Map<Class<?>, CachedDispatch> dispatchCache =
+            Collections.synchronizedMap(new java.util.WeakHashMap<Class<?>, CachedDispatch>());
+    private final ClassValue<ConcurrentMap<Method, InvokerFactory>> invokerFactories =
+            new ClassValue<ConcurrentMap<Method, InvokerFactory>>() {
+                @Override
+                protected ConcurrentMap<Method, InvokerFactory> computeValue(Class<?> type) {
+                    return new ConcurrentHashMap<Method, InvokerFactory>();
+                }
+            };
+    private final ClassValue<ListenerPlan> listenerPlans = new ClassValue<ListenerPlan>() {
+        @Override
+        protected ListenerPlan computeValue(Class<?> type) {
+            return buildListenerPlan(type);
+        }
+    };
+    private final ClassValue<ConcurrentMap<Field, FieldAccessor>> fieldAccessors =
+            new ClassValue<ConcurrentMap<Field, FieldAccessor>>() {
+                @Override
+                protected ConcurrentMap<Field, FieldAccessor> computeValue(Class<?> type) {
+                    return new ConcurrentHashMap<Field, FieldAccessor>();
+                }
+            };
     private final AtomicLong registrationOrder = new AtomicLong();
     private final AtomicLong mutationVersion = new AtomicLong();
+    private final AtomicLong dispatchedEvents = new AtomicLong();
+    private final AtomicLong handlerInvocations = new AtomicLong();
+    private final AtomicLong failures = new AtomicLong();
+    private final Map<Class<?>, MetricCounter> metricsByType =
+            Collections.synchronizedMap(new java.util.WeakHashMap<Class<?>, MetricCounter>());
     private volatile EventErrorHandler errorHandler = DEFAULT_ERROR_HANDLER;
+    private volatile ErrorPolicy errorPolicy = ErrorPolicy.CONTINUE;
 
     public EventManager() {
     }
@@ -82,8 +133,54 @@ public class EventManager {
         this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
     }
 
+    public EventManager(EventErrorHandler errorHandler, ErrorPolicy errorPolicy) {
+        this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
+        this.errorPolicy = errorPolicy != null ? errorPolicy : ErrorPolicy.CONTINUE;
+    }
+
     public void setErrorHandler(EventErrorHandler errorHandler) {
         this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
+    }
+
+    public ErrorPolicy getErrorPolicy() {
+        return errorPolicy;
+    }
+
+    public void setErrorPolicy(ErrorPolicy errorPolicy) {
+        this.errorPolicy = errorPolicy != null ? errorPolicy : ErrorPolicy.CONTINUE;
+    }
+
+    /** Returns a lock-free snapshot of dispatch counters. */
+    public EventMetrics metrics() {
+        return new EventMetrics(dispatchedEvents.get(), handlerInvocations.get(), failures.get());
+    }
+
+    /** Returns counters for one runtime event type without retaining its class loader forever. */
+    public EventMetrics metrics(Class<? extends Event> eventType) {
+        if (eventType == null) {
+            return new EventMetrics(null, 0L, 0L, 0L);
+        }
+        MetricCounter counter;
+        synchronized (metricsByType) {
+            counter = metricsByType.get(eventType);
+        }
+        return counter == null
+                ? new EventMetrics(eventType, 0L, 0L, 0L)
+                : counter.snapshot(eventType);
+    }
+
+    /** Resets dispatch counters without changing registrations. */
+    public void resetMetrics() {
+        dispatchedEvents.set(0L);
+        handlerInvocations.set(0L);
+        failures.set(0L);
+        metricsByType.clear();
+    }
+
+    /** Clears all registrations and cached dispatch plans. Safe to call repeatedly. */
+    @Override
+    public void close() {
+        clear();
     }
 
     public void register(Object... listeners) {
@@ -148,6 +245,75 @@ public class EventManager {
         return register(eventType, priority, false, action);
     }
 
+    public <T extends Event> Subscription registerOnce(Class<T> eventType, Consumer<? super T> action) {
+        return registerOnce(eventType, DEFAULT_PRIORITY, false, action);
+    }
+
+    public <T extends Event> Subscription registerOnce(Class<T> eventType, int priority,
+                                                       Consumer<? super T> action) {
+        return registerOnce(eventType, priority, false, action);
+    }
+
+    public <T extends Event> Subscription registerOnce(final Class<T> eventType, int priority,
+                                                       boolean ignoreCancelled,
+                                                       final Consumer<? super T> action) {
+        if (eventType == null || action == null) {
+            return Subscription.NOOP;
+        }
+
+        final Handler handler = new Handler(
+                action, null, null, null, eventType, normalizePriority(priority),
+                ignoreCancelled, registrationOrder.getAndIncrement(), true, null,
+                new Invoker() {
+                    @Override
+                    public void invoke(Event event) {
+                        action.accept(eventType.cast(event));
+                    }
+                }
+        );
+        addHandler(handler);
+        return new HandlerSubscription(handler);
+    }
+
+    public <T extends Event> Subscription registerFiltered(Class<T> eventType,
+                                                            Predicate<? super T> filter,
+                                                            Consumer<? super T> action) {
+        return registerFiltered(eventType, DEFAULT_PRIORITY, false, filter, action);
+    }
+
+    public <T extends Event> Subscription registerFiltered(Class<T> eventType, int priority,
+                                                            Predicate<? super T> filter,
+                                                            Consumer<? super T> action) {
+        return registerFiltered(eventType, priority, false, filter, action);
+    }
+
+    public <T extends Event> Subscription registerFiltered(final Class<T> eventType, int priority,
+                                                            boolean ignoreCancelled,
+                                                            final Predicate<? super T> filter,
+                                                            final Consumer<? super T> action) {
+        if (eventType == null || filter == null || action == null) {
+            return Subscription.NOOP;
+        }
+        final Handler handler = new Handler(
+                action, null, null, null, eventType, normalizePriority(priority),
+                ignoreCancelled, registrationOrder.getAndIncrement(), false,
+                new Predicate<Event>() {
+                    @Override
+                    public boolean test(Event event) {
+                        return filter.test(eventType.cast(event));
+                    }
+                },
+                new Invoker() {
+                    @Override
+                    public void invoke(Event event) {
+                        action.accept(eventType.cast(event));
+                    }
+                }
+        );
+        addHandler(handler);
+        return new HandlerSubscription(handler);
+    }
+
     public <T extends Event> Subscription register(final Class<T> eventType, int priority,
                                                    boolean ignoreCancelled, final Consumer<? super T> action) {
         if (eventType == null || action == null) {
@@ -163,6 +329,8 @@ public class EventManager {
                 normalizePriority(priority),
                 ignoreCancelled,
                 registrationOrder.getAndIncrement(),
+                false,
+                null,
                 new Invoker() {
                     @Override
                     public void invoke(Event event) {
@@ -203,6 +371,42 @@ public class EventManager {
                 normalizePriority(priority),
                 ignoreCancelled,
                 registrationOrder.getAndIncrement(),
+                false,
+                null,
+                new Invoker() {
+                    @SuppressWarnings({"unchecked", "rawtypes"})
+                    @Override
+                    public void invoke(Event event) {
+                        ((EventListener) listener).onEvent(eventType.cast(event));
+                    }
+                }
+        );
+        addHandler(handler);
+        return new HandlerSubscription(handler);
+    }
+
+    public <T extends Event> Subscription registerListenerOnce(Class<T> eventType,
+                                                               EventListener<? super T> listener) {
+        if (listener == null) {
+            return Subscription.NOOP;
+        }
+        return registerListenerOnce(eventType, listener.getPriority(), false, listener);
+    }
+
+    public <T extends Event> Subscription registerListenerOnce(Class<T> eventType, int priority,
+                                                               EventListener<? super T> listener) {
+        return registerListenerOnce(eventType, priority, false, listener);
+    }
+
+    public <T extends Event> Subscription registerListenerOnce(final Class<T> eventType, int priority,
+                                                               boolean ignoreCancelled,
+                                                               final EventListener<? super T> listener) {
+        if (eventType == null || listener == null) {
+            return Subscription.NOOP;
+        }
+        final Handler handler = new Handler(
+                listener, null, null, null, eventType, normalizePriority(priority),
+                ignoreCancelled, registrationOrder.getAndIncrement(), true, null,
                 new Invoker() {
                     @SuppressWarnings({"unchecked", "rawtypes"})
                     @Override
@@ -256,30 +460,47 @@ public class EventManager {
         if (listener instanceof Class<?>) {
             return subscribe((Class<?>) listener);
         }
-        register(listener);
-        return isRegistered(listener) ? new ListenerSubscription(listener, null) : Subscription.NOOP;
+        synchronized (this) {
+            if (isRegistered(listener)) {
+                return Subscription.NOOP;
+            }
+            register(listener);
+            return ownedSubscription(handlersForListener(listener, null));
+        }
     }
 
     public Subscription subscribe(Class<?> listenerClass) {
         if (listenerClass == null) {
             return Subscription.NOOP;
         }
-        register(listenerClass);
-        return isRegistered(listenerClass) ? new ListenerSubscription(listenerClass, null) : Subscription.NOOP;
+        synchronized (this) {
+            if (isRegistered(listenerClass)) {
+                return Subscription.NOOP;
+            }
+            register(listenerClass);
+            return ownedSubscription(handlersForListener(listenerClass, null));
+        }
     }
 
     public Subscription subscribe(Object listener, Class<? extends Event> eventClass) {
         if (listener == null || eventClass == null) {
             return Subscription.NOOP;
         }
-        if (listener instanceof Class<?>) {
-            register((Class<?>) listener, eventClass);
-        } else {
-            register(listener, eventClass);
+        synchronized (this) {
+            if (isRegistered(listener, eventClass)) {
+                return Subscription.NOOP;
+            }
+            if (listener instanceof Class<?>) {
+                register((Class<?>) listener, eventClass);
+            } else {
+                register(listener, eventClass);
+            }
+            return ownedSubscription(handlersForListener(listener, eventClass));
         }
-        return isRegistered(listener, eventClass)
-                ? new ListenerSubscription(listener, eventClass)
-                : Subscription.NOOP;
+    }
+
+    private Subscription ownedSubscription(Handler[] handlers) {
+        return handlers.length == 0 ? Subscription.NOOP : new ListenerSubscription(handlers);
     }
 
     public void unregister(final Object listener) {
@@ -339,6 +560,14 @@ public class EventManager {
     }
 
     public void unregister(final Class<?> listenerClass) {
+        unregisterAssignable(listenerClass);
+    }
+
+    /**
+     * Removes handlers owned by the class itself or by instances assignable to it.
+     * This is the historical {@link #unregister(Class)} behavior.
+     */
+    public void unregisterAssignable(final Class<?> listenerClass) {
         if (listenerClass == null) {
             return;
         }
@@ -352,6 +581,12 @@ public class EventManager {
     }
 
     public void unregister(final Class<?> listenerClass, final Class<? extends Event> eventClass) {
+        unregisterAssignable(listenerClass, eventClass);
+    }
+
+    /** Removes handlers for the exact event type owned by the class or its instances. */
+    public void unregisterAssignable(final Class<?> listenerClass,
+                                     final Class<? extends Event> eventClass) {
         if (listenerClass == null || eventClass == null) {
             return;
         }
@@ -367,12 +602,47 @@ public class EventManager {
         });
     }
 
+    /** Removes only handlers whose owner is exactly this class or an instance of this class. */
+    public void unregisterExact(final Class<?> listenerClass) {
+        if (listenerClass == null) {
+            return;
+        }
+        removeHandlers(new Predicate<Handler>() {
+            @Override
+            public boolean test(Handler handler) {
+                return handler.listener == listenerClass
+                        || (!(handler.listener instanceof Class<?>)
+                        && listenerClass == handler.listener.getClass());
+            }
+        });
+    }
+
+    /** Removes only exact-event handlers whose owner is exactly this class or an instance of this class. */
+    public void unregisterExact(final Class<?> listenerClass,
+                                 final Class<? extends Event> eventClass) {
+        if (listenerClass == null || eventClass == null) {
+            return;
+        }
+        removeHandlers(new Predicate<Handler>() {
+            @Override
+            public boolean test(Handler handler) {
+                return handler.eventType == eventClass
+                        && (handler.listener == listenerClass
+                        || (!(handler.listener instanceof Class<?>)
+                        && listenerClass == handler.listener.getClass()));
+            }
+        });
+    }
+
     public void clear() {
         boolean hadRegistrations = !eventHandlers.isEmpty() || !dispatchCache.isEmpty();
+        for (Handler[] handlers : eventHandlers.values()) {
+            for (Handler handler : handlers) {
+                handler.active = false;
+            }
+        }
         eventHandlers.clear();
         dispatchCache.clear();
-        listenerPlans.clear();
-        invokerFactories.clear();
         if (hadRegistrations) {
             mutationVersion.incrementAndGet();
         }
@@ -382,7 +652,11 @@ public class EventManager {
         if (eventType == null) {
             return;
         }
-        if (eventHandlers.remove(eventType) != null) {
+        Handler[] removed = eventHandlers.remove(eventType);
+        if (removed != null) {
+            for (Handler handler : removed) {
+                handler.active = false;
+            }
             dispatchCache.clear();
             mutationVersion.incrementAndGet();
         }
@@ -466,6 +740,19 @@ public class EventManager {
         return count;
     }
 
+    /** Returns a stable, read-only snapshot of event types with registered handlers. */
+    public Set<Class<? extends Event>> registeredEventTypes() {
+        if (eventHandlers.isEmpty()) {
+            return Collections.emptySet();
+        }
+        return Collections.unmodifiableSet(new HashSet<Class<? extends Event>>(eventHandlers.keySet()));
+    }
+
+    /** Returns whether this bus currently has no registered handlers. */
+    public boolean isEmpty() {
+        return eventHandlers.isEmpty();
+    }
+
     public int handlerCount(Class<? extends Event> eventType) {
         return eventType == null ? 0 : handlersFor(eventType).length;
     }
@@ -486,6 +773,9 @@ public class EventManager {
         if (event == null) {
             return null;
         }
+
+        dispatchedEvents.incrementAndGet();
+        recordDispatch(event.getClass());
 
         Handler[] handlers = handlersFor(event.getClass());
         if (handlers.length == 0) {
@@ -514,6 +804,9 @@ public class EventManager {
             return null;
         }
 
+        dispatchedEvents.incrementAndGet();
+        recordDispatch(event.getClass());
+
         Handler[] handlers = exactHandlersFor(event.getClass());
         if (handlers.length != 0) {
             dispatch(event, handlers);
@@ -534,6 +827,49 @@ public class EventManager {
         }
     }
 
+    /**
+     * Dispatches an event through the supplied executor. The returned future
+     * completes with the same event instance after dispatch finishes.
+     */
+    public <T extends Event> CompletableFuture<T> callAsync(final T event, Executor executor) {
+        return submit(event, executor, false);
+    }
+
+    /**
+     * Dispatches an event to exact-type handlers through the supplied executor.
+     */
+    public <T extends Event> CompletableFuture<T> callExactAsync(final T event, Executor executor) {
+        return submit(event, executor, true);
+    }
+
+    private <T extends Event> CompletableFuture<T> submit(final T event, Executor executor,
+                                                            final boolean exact) {
+        final CompletableFuture<T> future = new CompletableFuture<T>();
+        if (event == null) {
+            future.complete(null);
+            return future;
+        }
+        if (executor == null) {
+            future.completeExceptionally(new NullPointerException("executor"));
+            return future;
+        }
+        try {
+            executor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        future.complete(exact ? callExact(event) : call(event));
+                    } catch (Throwable t) {
+                        future.completeExceptionally(t);
+                    }
+                }
+            });
+        } catch (Throwable submissionFailure) {
+            future.completeExceptionally(submissionFailure);
+        }
+        return future;
+    }
+
     public <T extends Event> T call(Class<T> eventType, Supplier<T> supplier) {
         if (eventType == null || supplier == null || !hasListeners(eventType)) {
             return null;
@@ -551,17 +887,28 @@ public class EventManager {
     private void dispatch(Event event, Handler[] handlers) {
         Cancellable cancellable = event instanceof Cancellable ? (Cancellable) event : null;
         Stoppable stoppable = event instanceof Stoppable ? (Stoppable) event : null;
+        boolean stoppableReadable = true;
+        boolean cancellableReadable = true;
 
         for (int i = 0; i < handlers.length; i++) {
             Handler handler = handlers[i];
 
-            if (stoppable != null) {
+            // A dispatch snapshot may outlive a concurrent unregister/clear.
+            if (!handler.active) {
+                continue;
+            }
+
+            if (stoppable != null && stoppableReadable) {
                 boolean stopped;
                 try {
                     stopped = stoppable.isStopped();
                 } catch (Throwable t) {
-                    reportFailure(event, event, t);
-                    return;
+                    if (!handleFailure(event, event, t)) return;
+                    // Under CONTINUE, treat an unreadable state as false for
+                    // this handler instead of repeatedly invoking the broken
+                    // accessor for every remaining handler.
+                    stopped = false;
+                    stoppableReadable = false;
                 }
                 if (stopped) {
                     break;
@@ -572,41 +919,113 @@ public class EventManager {
             try {
                 handling = handler.isHandlingEvents();
             } catch (Throwable t) {
-                reportFailure(event, handler.listener, t);
+                if (!handleFailure(event, handler.listener, t)) return;
                 continue;
             }
             if (!handling) {
                 continue;
             }
 
-            if (cancellable != null && handler.ignoreCancelled) {
+            if (cancellable != null && handler.ignoreCancelled && cancellableReadable) {
                 boolean cancelled;
                 try {
                     cancelled = cancellable.isCancelled();
                 } catch (Throwable t) {
-                    reportFailure(event, event, t);
-                    return;
+                    if (!handleFailure(event, event, t)) return;
+                    // Under CONTINUE, treat an unreadable state as false for
+                    // this handler; the failure has already been reported.
+                    cancelled = false;
+                    cancellableReadable = false;
                 }
                 if (cancelled) {
                     continue;
                 }
             }
 
+            if (handler.filter != null) {
+                boolean accepted;
+                try {
+                    accepted = handler.filter.test(event);
+                } catch (Throwable t) {
+                    if (!handleFailure(event, handler.listener, t)) return;
+                    continue;
+                }
+                if (!accepted) {
+                    continue;
+                }
+            }
+
             try {
+                if (handler.once) {
+                    removeHandlers(new Predicate<Handler>() {
+                        @Override
+                        public boolean test(Handler candidate) {
+                            return candidate == handler;
+                        }
+                    });
+                }
+                handlerInvocations.incrementAndGet();
+                recordInvocation(event.getClass());
                 handler.invoke(event);
             } catch (Throwable t) {
-                reportFailure(event, handler.listener, t);
+                if (!handleFailure(event, handler.listener, t)) return;
             }
         }
     }
 
-    private void reportFailure(Event event, Object source, Throwable throwable) {
+    private boolean handleFailure(Event event, Object source, Throwable throwable) {
+        failures.incrementAndGet();
+        recordFailure(event == null ? null : event.getClass());
         try {
             errorHandler.handle(event, source, throwable);
         } catch (Throwable errorHandlerFailure) {
             log.log(Level.SEVERE, "Event error handler threw while handling a listener failure",
                     errorHandlerFailure);
         }
+        ErrorPolicy policy = errorPolicy;
+        if (policy == ErrorPolicy.PROPAGATE) {
+            throw propagate(event, source, throwable);
+        }
+        return policy == ErrorPolicy.CONTINUE;
+    }
+
+    private MetricCounter counterFor(Class<?> eventType) {
+        if (eventType == null) {
+            return null;
+        }
+        synchronized (metricsByType) {
+            MetricCounter counter = metricsByType.get(eventType);
+            if (counter == null) {
+                counter = new MetricCounter();
+                metricsByType.put(eventType, counter);
+            }
+            return counter;
+        }
+    }
+
+    private void recordDispatch(Class<?> eventType) {
+        MetricCounter counter = counterFor(eventType);
+        if (counter != null) counter.dispatchedEvents.incrementAndGet();
+    }
+
+    private void recordInvocation(Class<?> eventType) {
+        MetricCounter counter = counterFor(eventType);
+        if (counter != null) counter.handlerInvocations.incrementAndGet();
+    }
+
+    private void recordFailure(Class<?> eventType) {
+        MetricCounter counter = counterFor(eventType);
+        if (counter != null) counter.failures.incrementAndGet();
+    }
+
+    private static RuntimeException propagate(Event event, Object source, Throwable throwable) {
+        if (throwable instanceof RuntimeException) {
+            return (RuntimeException) throwable;
+        }
+        if (throwable instanceof Error) {
+            throw (Error) throwable;
+        }
+        return new EventDispatchException(event, source, throwable);
     }
 
     private Handler[] handlersFor(Class<?> eventClass) {
@@ -640,30 +1059,27 @@ public class EventManager {
     }
 
     private ListenerPlan listenerPlanFor(final Class<?> listenerClass) {
-        return listenerPlans.computeIfAbsent(listenerClass,
-                new java.util.function.Function<Class<?>, ListenerPlan>() {
-                    @Override
-                    public ListenerPlan apply(Class<?> type) {
-                        return buildListenerPlan(type);
-                    }
-                });
+        return listenerPlans.get(listenerClass);
     }
 
     private ListenerPlan buildListenerPlan(Class<?> listenerClass) {
         List<HandlerDefinition> definitions = new ArrayList<HandlerDefinition>();
         scanListenerType(listenerClass, definitions, new HashSet<Class<?>>(),
-                new java.util.HashMap<MethodSignature, List<Method>>());
+                new java.util.HashMap<MethodSignature, List<Method>>(), listenerClass);
         return new ListenerPlan(definitions.toArray(new HandlerDefinition[definitions.size()]));
     }
 
     private void scanListenerType(Class<?> type, List<HandlerDefinition> definitions,
-                                  Set<Class<?>> visitedTypes,
-                                  Map<MethodSignature, List<Method>> seenMethods) {
+                                   Set<Class<?>> visitedTypes,
+                                   Map<MethodSignature, List<Method>> seenMethods,
+                                   Class<?> concreteListenerClass) {
         if (type == null || type == Object.class || !visitedTypes.add(type)) {
             return;
         }
 
-        for (Method method : type.getDeclaredMethods()) {
+        Method[] declaredMethods = type.getDeclaredMethods();
+        Arrays.sort(declaredMethods, METHOD_SCAN_ORDER);
+        for (Method method : declaredMethods) {
             if (method.isSynthetic() || method.isBridge()) {
                 continue;
             }
@@ -705,7 +1121,9 @@ public class EventManager {
             ));
         }
 
-        for (Field field : type.getDeclaredFields()) {
+        Field[] declaredFields = type.getDeclaredFields();
+        Arrays.sort(declaredFields, FIELD_SCAN_ORDER);
+        for (Field field : declaredFields) {
             if (field.isSynthetic() || !field.isAnnotationPresent(EventTarget.class)) {
                 continue;
             }
@@ -714,7 +1132,7 @@ public class EventManager {
                 continue;
             }
 
-            Class<? extends Event> fieldEventType = eventTypeFromField(field);
+            Class<? extends Event> fieldEventType = eventTypeFromField(field, concreteListenerClass);
             if (fieldEventType == null) {
                 log.warning("Skipping listener field " + field
                         + " because its EventListener event type could not be inferred");
@@ -733,10 +1151,17 @@ public class EventManager {
             ));
         }
 
-        for (Class<?> iface : type.getInterfaces()) {
-            scanListenerType(iface, definitions, visitedTypes, seenMethods);
+        Class<?>[] interfaces = type.getInterfaces();
+        Arrays.sort(interfaces, new Comparator<Class<?>>() {
+            @Override
+            public int compare(Class<?> left, Class<?> right) {
+                return left.getName().compareTo(right.getName());
+            }
+        });
+        for (Class<?> iface : interfaces) {
+            scanListenerType(iface, definitions, visitedTypes, seenMethods, concreteListenerClass);
         }
-        scanListenerType(type.getSuperclass(), definitions, visitedTypes, seenMethods);
+        scanListenerType(type.getSuperclass(), definitions, visitedTypes, seenMethods, concreteListenerClass);
     }
 
     private static int annotationPriority(EventTarget eventTarget, int fallback) {
@@ -846,8 +1271,8 @@ public class EventManager {
                     definition.staticMember ? method.getDeclaringClass() : listener,
                     definition.eventType,
                     normalizePriority(definition.priority),
-                    definition.ignoreCancelled,
-                    registrationOrder.getAndIncrement(),
+                        definition.ignoreCancelled,
+                        registrationOrder.getAndIncrement(), false, null,
                     invokerFor(method, listener)
             );
             addHandler(handler);
@@ -855,15 +1280,14 @@ public class EventManager {
         }
 
         Field field = definition.field;
-        EventListener<?> fieldListener = listenerFromField(listener, field);
+        EventListener<?> fieldListener = listenerFromField(listener, field, true);
         if (fieldListener == null) {
             return;
         }
 
         final Class<? extends Event> dispatchType = definition.eventType;
-        final EventListener<?> dispatchListener = fieldListener;
         int priority = definition.listenerPriority
-                ? fieldListener.getPriority()
+                ? listenerPriority(fieldListener)
                 : definition.priority;
 
         Handler handler = new Handler(
@@ -874,12 +1298,17 @@ public class EventManager {
                 dispatchType,
                 normalizePriority(priority),
                 definition.ignoreCancelled,
-                registrationOrder.getAndIncrement(),
+                registrationOrder.getAndIncrement(), false, null,
                 new Invoker() {
                     @SuppressWarnings({"unchecked", "rawtypes"})
                     @Override
                     public void invoke(Event event) {
-                        ((EventListener) dispatchListener).onEvent(dispatchType.cast(event));
+                        // Resolve mutable fields at dispatch time so replacing the
+                        // callback takes effect without a second registration.
+                        EventListener<?> current = listenerFromField(listener, field, false);
+                        if (current != null) {
+                            ((EventListener) current).onEvent(dispatchType.cast(event));
+                        }
                     }
                 }
         );
@@ -899,8 +1328,35 @@ public class EventManager {
             }
         });
         if (added[0]) {
+            // Registration invalidates every flattened hierarchy cache. Clearing
+            // eagerly prevents stale Class keys from accumulating when callers
+            // create many short-lived event classes.
+            dispatchCache.clear();
             mutationVersion.incrementAndGet();
         }
+    }
+
+    private Handler[] handlersForListener(Object listener, Class<? extends Event> eventClass) {
+        List<Handler> matching = new ArrayList<Handler>();
+        if (eventClass != null) {
+            Handler[] handlers = eventHandlers.get(eventClass);
+            if (handlers != null) {
+                for (Handler handler : handlers) {
+                    if (handler.listener == listener) {
+                        matching.add(handler);
+                    }
+                }
+            }
+        } else {
+            for (Handler[] handlers : eventHandlers.values()) {
+                for (Handler handler : handlers) {
+                    if (handler.listener == listener) {
+                        matching.add(handler);
+                    }
+                }
+            }
+        }
+        return matching.toArray(new Handler[matching.size()]);
     }
 
     private void removeHandlers(final Predicate<Handler> predicate) {
@@ -909,7 +1365,16 @@ public class EventManager {
             eventHandlers.computeIfPresent(eventType, new java.util.function.BiFunction<Class<? extends Event>, Handler[], Handler[]>() {
                 @Override
                 public Handler[] apply(Class<? extends Event> key, Handler[] handlers) {
-                    Handler[] updated = removeMatching(handlers, predicate);
+                    Handler[] updated = removeMatching(handlers, new Predicate<Handler>() {
+                        @Override
+                        public boolean test(Handler candidate) {
+                            boolean matches = predicate.test(candidate);
+                            if (matches) {
+                                candidate.active = false;
+                            }
+                            return matches;
+                        }
+                    });
                     if (updated != handlers) {
                         removed[0] = true;
                     }
@@ -943,39 +1408,113 @@ public class EventManager {
         collectHandlers(type.getSuperclass(), collected, visitedTypes);
     }
 
-    private EventListener<?> listenerFromField(Object listener, Field field) {
-        boolean isStatic = Modifier.isStatic(field.getModifiers());
-        boolean wasAccessible = field.isAccessible();
+    private static int listenerPriority(EventListener<?> listener) {
         try {
-            field.setAccessible(true);
-        } catch (SecurityException ignored) {
-
+            return listener.getPriority();
+        } catch (Throwable t) {
+            log.log(Level.WARNING, "EventListener.getPriority() failed; using normal priority", t);
+            return DEFAULT_PRIORITY;
         }
+    }
 
+    private EventListener<?> listenerFromField(Object listener, Field field, boolean reportFailure) {
         try {
-            Object value = field.get(isStatic ? null : listener);
+            Object value = fieldAccessor(field).get(Modifier.isStatic(field.getModifiers()) ? null : listener);
             if (value == null) {
-                log.warning("Skipping listener field " + field + " because its value is null");
+                if (reportFailure) {
+                    log.warning("Skipping listener field " + field + " because its value is null");
+                }
                 return null;
             }
             if (!(value instanceof EventListener<?>)) {
-                log.warning("Skipping listener field " + field + " because its value is not an EventListener");
+                if (reportFailure) {
+                    log.warning("Skipping listener field " + field
+                            + " because its value is not an EventListener");
+                }
                 return null;
             }
             return (EventListener<?>) value;
         } catch (IllegalAccessException e) {
-            log.log(Level.WARNING, "Skipping listener field " + field + " because it is not accessible", e);
+            if (reportFailure) {
+                log.log(Level.WARNING, "Skipping listener field " + field
+                        + " because it is not accessible", e);
+            }
             return null;
+        } catch (RuntimeException e) {
+            if (reportFailure) {
+                log.log(Level.WARNING, "Skipping listener field " + field
+                        + " because it could not be read", e);
+            }
+            return null;
+        } catch (Throwable e) {
+            if (reportFailure) {
+                log.log(Level.WARNING, "Skipping listener field " + field
+                        + " because it could not be read", e);
+            }
+            return null;
+        }
+    }
+
+    private FieldAccessor fieldAccessor(final Field field) {
+        ConcurrentMap<Field, FieldAccessor> accessors = fieldAccessors.get(field.getDeclaringClass());
+        FieldAccessor accessor = accessors.get(field);
+        if (accessor == null) {
+            FieldAccessor created = buildFieldAccessor(field);
+            FieldAccessor previous = accessors.putIfAbsent(field, created);
+            accessor = previous != null ? previous : created;
+        }
+        return accessor;
+    }
+
+    private static FieldAccessor buildFieldAccessor(final Field field) {
+        final boolean isStatic = Modifier.isStatic(field.getModifiers());
+        boolean wasAccessible = field.isAccessible();
+        try {
+            try {
+                field.setAccessible(true);
+            } catch (SecurityException ignored) {
+                // The lookup or reflective fallback may still be able to access it.
+            } catch (RuntimeException inaccessible) {
+                // Strongly encapsulated modules can reject this; try the lookup below.
+            }
+
+            MethodHandles.Lookup lookup = lookupFor(field.getDeclaringClass());
+            MethodHandle getter = lookup.unreflectGetter(field);
+            if (isStatic) {
+                final MethodHandle adapted = getter.asType(MethodType.methodType(Object.class));
+                return new FieldAccessor() {
+                    @Override
+                    @SneakyThrows
+                    public Object get(Object owner) {
+                        return (Object) adapted.invokeExact();
+                    }
+                };
+            }
+            final MethodHandle adapted = getter.asType(MethodType.methodType(Object.class, Object.class));
+            return new FieldAccessor() {
+                @Override
+                @SneakyThrows
+                public Object get(Object owner) {
+                    return (Object) adapted.invokeExact(owner);
+                }
+            };
+        } catch (Throwable lookupFailure) {
+            return new FieldAccessor() {
+                @Override
+                public Object get(Object owner) throws IllegalAccessException {
+                    return field.get(isStatic ? null : owner);
+                }
+            };
         } finally {
             try {
                 field.setAccessible(wasAccessible);
-            } catch (SecurityException ignored) {
-
+            } catch (Throwable ignored) {
+                // Best effort: the accessor is already built and no longer needs this flag.
             }
         }
     }
 
-    private static Class<? extends Event> eventTypeFromField(Field field) {
+    private static Class<? extends Event> eventTypeFromField(Field field, Class<?> listenerClass) {
         Type genericType = field.getGenericType();
         if (!(genericType instanceof ParameterizedType)) {
             return null;
@@ -988,11 +1527,77 @@ public class EventManager {
         }
 
         Type eventType = parameterizedType.getActualTypeArguments()[0];
+        eventType = resolveType(eventType, typeArgumentsFor(listenerClass, field.getDeclaringClass()));
         Class<?> eventClass = classFromType(eventType);
         if (eventClass == null || !Event.class.isAssignableFrom(eventClass)) {
             return null;
         }
         return eventClass.asSubclass(Event.class);
+    }
+
+    private static Map<TypeVariable<?>, Type> typeArgumentsFor(Class<?> concreteType, Class<?> targetType) {
+        Map<TypeVariable<?>, Type> resolved = findTypeArguments(concreteType, targetType,
+                new java.util.HashMap<TypeVariable<?>, Type>(), new HashSet<Class<?>>());
+        return resolved == null
+                ? Collections.<TypeVariable<?>, Type>emptyMap()
+                : resolved;
+    }
+
+    private static Map<TypeVariable<?>, Type> findTypeArguments(Type currentType, Class<?> targetType,
+                                                                 Map<TypeVariable<?>, Type> inherited,
+                                                                 Set<Class<?>> visited) {
+        Class<?> currentClass;
+        Map<TypeVariable<?>, Type> currentArguments = new java.util.HashMap<TypeVariable<?>, Type>(inherited);
+        if (currentType instanceof ParameterizedType) {
+            ParameterizedType parameterized = (ParameterizedType) currentType;
+            if (!(parameterized.getRawType() instanceof Class<?>)) {
+                return null;
+            }
+            currentClass = (Class<?>) parameterized.getRawType();
+            TypeVariable<?>[] variables = currentClass.getTypeParameters();
+            Type[] actuals = parameterized.getActualTypeArguments();
+            for (int i = 0; i < variables.length; i++) {
+                currentArguments.put(variables[i], resolveType(actuals[i], inherited));
+            }
+        } else if (currentType instanceof Class<?>) {
+            currentClass = (Class<?>) currentType;
+        } else {
+            return null;
+        }
+
+        if (currentClass == targetType) {
+            return currentArguments;
+        }
+        if (!visited.add(currentClass)) {
+            return null;
+        }
+
+        for (Type iface : currentClass.getGenericInterfaces()) {
+            Map<TypeVariable<?>, Type> result = findTypeArguments(iface, targetType,
+                    currentArguments, new HashSet<Class<?>>(visited));
+            if (result != null) {
+                return result;
+            }
+        }
+        Type superclass = currentClass.getGenericSuperclass();
+        if (superclass != null) {
+            return findTypeArguments(superclass, targetType, currentArguments,
+                    new HashSet<Class<?>>(visited));
+        }
+        return null;
+    }
+
+    private static Type resolveType(Type type, Map<TypeVariable<?>, Type> mappings) {
+        Type resolved = type;
+        Set<Type> seen = Collections.newSetFromMap(new IdentityHashMap<Type, Boolean>());
+        while (resolved instanceof TypeVariable<?> && seen.add(resolved)) {
+            Type replacement = mappings.get(resolved);
+            if (replacement == null) {
+                break;
+            }
+            resolved = replacement;
+        }
+        return resolved;
     }
 
     private static Class<?> classFromType(Type type) {
@@ -1028,7 +1633,9 @@ public class EventManager {
         if (left.equals(right)) {
             return true;
         }
-        return left.getName().equals(right.getName())
+        return left.getDeclaringClass() == right.getDeclaringClass()
+                && left.getReturnType() == right.getReturnType()
+                && left.getName().equals(right.getName())
                 && java.util.Arrays.equals(left.getParameterTypes(), right.getParameterTypes());
     }
 
@@ -1039,7 +1646,8 @@ public class EventManager {
         if (left.equals(right)) {
             return true;
         }
-        return left.getName().equals(right.getName()) && left.getType() == right.getType();
+        return left.getDeclaringClass() == right.getDeclaringClass()
+                && left.getName().equals(right.getName()) && left.getType() == right.getType();
     }
 
     private static Handler[] insertHandler(Handler[] current, Handler handler) {
@@ -1087,12 +1695,13 @@ public class EventManager {
     }
 
     private Invoker invokerFor(Method method, Object listener) {
-        InvokerFactory factory = invokerFactories.computeIfAbsent(method, new java.util.function.Function<Method, InvokerFactory>() {
-            @Override
-            public InvokerFactory apply(Method key) {
-                return buildInvokerFactory(key);
-            }
-        });
+        ConcurrentMap<Method, InvokerFactory> factories = invokerFactories.get(method.getDeclaringClass());
+        InvokerFactory factory = factories.get(method);
+        if (factory == null) {
+            InvokerFactory created = buildInvokerFactory(method);
+            InvokerFactory previous = factories.putIfAbsent(method, created);
+            factory = previous != null ? previous : created;
+        }
         return factory.create(listener);
     }
 
@@ -1103,6 +1712,8 @@ public class EventManager {
             method.setAccessible(true);
         } catch (SecurityException ignored) {
 
+        } catch (RuntimeException inaccessible) {
+            // Method-handle and reflection fallbacks below may still work.
         }
 
         MethodHandles.Lookup lookup = lookupFor(method.getDeclaringClass());
@@ -1246,6 +1857,10 @@ public class EventManager {
         Invoker create(Object listener);
     }
 
+    private interface FieldAccessor {
+        Object get(Object owner) throws Throwable;
+    }
+
     @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private final class HandlerSubscription implements Subscription {
         private final Handler handler;
@@ -1284,8 +1899,7 @@ public class EventManager {
 
     @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private final class ListenerSubscription implements Subscription {
-        private final Object listener;
-        private final Class<? extends Event> eventClass;
+        private final Handler[] handlers;
         private final AtomicBoolean subscribed = new AtomicBoolean(true);
 
         @Override
@@ -1293,11 +1907,15 @@ public class EventManager {
             if (!subscribed.compareAndSet(true, false)) {
                 return;
             }
-            if (eventClass == null) {
-                EventManager.this.unregister(listener);
-            } else {
-                EventManager.this.unregister(listener, eventClass);
-            }
+            final Set<Handler> owned = Collections.newSetFromMap(
+                    new IdentityHashMap<Handler, Boolean>());
+            Collections.addAll(owned, handlers);
+            removeHandlers(new Predicate<Handler>() {
+                @Override
+                public boolean test(Handler candidate) {
+                    return owned.contains(candidate);
+                }
+            });
         }
 
         @Override
@@ -1305,9 +1923,17 @@ public class EventManager {
             if (!subscribed.get()) {
                 return false;
             }
-            return eventClass == null
-                    ? EventManager.this.isRegistered(listener)
-                    : EventManager.this.isRegistered(listener, eventClass);
+            for (Handler handler : handlers) {
+                Handler[] current = eventHandlers.get(handler.eventType);
+                if (current != null) {
+                    for (Handler candidate : current) {
+                        if (candidate == handler) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
         }
     }
 
@@ -1363,18 +1989,35 @@ public class EventManager {
         Handler[] handlers;
     }
 
-    @AllArgsConstructor(access = AccessLevel.PRIVATE)
-    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
     private static final class Handler {
-        Object listener;
-        Method method;
-        Field field;
-        Object dedupeOwner;
-        Class<? extends Event> eventType;
-        int priority;
-        boolean ignoreCancelled;
-        long order;
-        Invoker invoker;
+        private final Object listener;
+        private final Method method;
+        private final Field field;
+        private final Object dedupeOwner;
+        private final Class<? extends Event> eventType;
+        private final int priority;
+        private final boolean ignoreCancelled;
+        private final long order;
+        private final boolean once;
+        private final Predicate<Event> filter;
+        private final Invoker invoker;
+        private volatile boolean active = true;
+
+        private Handler(Object listener, Method method, Field field, Object dedupeOwner,
+                        Class<? extends Event> eventType, int priority, boolean ignoreCancelled,
+                        long order, boolean once, Predicate<Event> filter, Invoker invoker) {
+            this.listener = listener;
+            this.method = method;
+            this.field = field;
+            this.dedupeOwner = dedupeOwner;
+            this.eventType = eventType;
+            this.priority = priority;
+            this.ignoreCancelled = ignoreCancelled;
+            this.order = order;
+            this.once = once;
+            this.filter = filter;
+            this.invoker = invoker;
+        }
 
         private void invoke(Event event) throws Throwable {
             invoker.invoke(event);
@@ -1415,6 +2058,17 @@ public class EventManager {
                 return System.identityHashCode(this);
             }
             return 31 * System.identityHashCode(dedupeOwner) + Objects.hashCode(member);
+        }
+    }
+
+    private static final class MetricCounter {
+        private final AtomicLong dispatchedEvents = new AtomicLong();
+        private final AtomicLong handlerInvocations = new AtomicLong();
+        private final AtomicLong failures = new AtomicLong();
+
+        private EventMetrics snapshot(Class<?> eventType) {
+            return new EventMetrics(eventType, dispatchedEvents.get(),
+                    handlerInvocations.get(), failures.get());
         }
     }
 

@@ -13,17 +13,20 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class EventManagerTest {
 
@@ -294,31 +297,20 @@ class EventManagerTest {
     }
 
     @Test
-    void clearReleasesScanCachesAndStaysUsable() throws Exception {
+    void clearRemovesHandlersAndStaysUsable() {
         EventManager events = new EventManager();
         events.register(new CountingListener());
         events.register(new FieldListener());
         events.call(new Ping());
 
-        assertFalse(cacheOf(events, "listenerPlans").isEmpty());
-        assertFalse(cacheOf(events, "invokerFactories").isEmpty());
-
         events.clear();
 
         assertEquals(0, events.handlerCount());
-        assertTrue(cacheOf(events, "listenerPlans").isEmpty());
-        assertTrue(cacheOf(events, "invokerFactories").isEmpty());
 
         CountingListener rebound = new CountingListener();
         events.register(rebound);
         events.call(new Ping());
         assertEquals(1, rebound.getPings());
-    }
-
-    private static Map<?, ?> cacheOf(EventManager events, String name) throws Exception {
-        Field field = EventManager.class.getDeclaredField(name);
-        field.setAccessible(true);
-        return (Map<?, ?>) field.get(events);
     }
 
     @Test
@@ -370,6 +362,83 @@ class EventManagerTest {
     }
 
     @Test
+    void stopPolicyReportsAndStopsTheCurrentDispatch() {
+        EventManager events = new EventManager();
+        events.setErrorPolicy(ErrorPolicy.STOP);
+        AtomicInteger later = new AtomicInteger();
+        events.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping ping) {
+                throw new IllegalStateException("stop");
+            }
+        });
+        events.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping ping) {
+                later.incrementAndGet();
+            }
+        });
+
+        events.call(new Ping());
+        assertEquals(0, later.get());
+    }
+
+    @Test
+    void propagatePolicyRethrowsRuntimeFailures() {
+        EventManager events = new EventManager();
+        events.setErrorPolicy(ErrorPolicy.PROPAGATE);
+        final IllegalArgumentException expected = new IllegalArgumentException("propagate");
+        AtomicReference<Throwable> seen = new AtomicReference<Throwable>();
+        events.setErrorHandler(new EventErrorHandler() {
+            @Override
+            public void handle(Event event, Object listener, Throwable throwable) {
+                seen.set(throwable);
+            }
+        });
+        events.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping ping) {
+                throw expected;
+            }
+        });
+
+        IllegalArgumentException actual = assertThrows(IllegalArgumentException.class,
+                () -> events.call(new Ping()));
+        assertSame(expected, actual);
+        assertSame(expected, seen.get());
+    }
+
+    @Test
+    void brokenStoppableStateIsReportedOnlyOnceInContinueMode() {
+        EventManager events = new EventManager();
+        AtomicInteger failures = new AtomicInteger();
+        AtomicInteger calls = new AtomicInteger();
+        events.setErrorHandler((event, listener, throwable) -> failures.incrementAndGet());
+        events.register(BrokenHalt.class, event -> calls.incrementAndGet());
+        events.register(BrokenHalt.class, event -> calls.incrementAndGet());
+
+        events.call(new BrokenHalt());
+
+        assertEquals(1, failures.get());
+        assertEquals(2, calls.get());
+    }
+
+    @Test
+    void brokenCancellableStateDoesNotSuppressIgnoredHandlersInContinueMode() {
+        EventManager events = new EventManager();
+        AtomicInteger failures = new AtomicInteger();
+        AtomicInteger calls = new AtomicInteger();
+        events.setErrorHandler((event, listener, throwable) -> failures.incrementAndGet());
+        events.register(BrokenCancel.class, Priority.NORMAL, true, event -> calls.incrementAndGet());
+        events.register(BrokenCancel.class, Priority.NORMAL, true, event -> calls.incrementAndGet());
+
+        events.call(new BrokenCancel());
+
+        assertEquals(1, failures.get());
+        assertEquals(2, calls.get());
+    }
+
+    @Test
     void eventSubscriberCanOptOutWithoutUnregistering() {
         EventManager events = new EventManager();
         ToggleListener listener = new ToggleListener();
@@ -396,6 +465,151 @@ class EventManagerTest {
             }
         });
         assertEquals(1, completed.get());
+    }
+
+    @Test
+    void asyncDispatchUsesTheProvidedExecutor() throws Exception {
+        EventManager events = new EventManager();
+        AtomicInteger calls = new AtomicInteger();
+        AtomicBoolean executed = new AtomicBoolean();
+        Executor directExecutor = command -> {
+            executed.set(true);
+            command.run();
+        };
+        Ping event = new Ping();
+        events.register(Ping.class, ping -> calls.incrementAndGet());
+
+        CompletableFuture<Ping> completion = events.callAsync(event, directExecutor);
+
+        assertSame(event, completion.get());
+        assertTrue(executed.get());
+        assertEquals(1, calls.get());
+    }
+
+    @Test
+    void compositeSubscriptionAttemptsEveryCleanup() {
+        AtomicInteger cleaned = new AtomicInteger();
+        final RuntimeException expected = new RuntimeException("cleanup");
+        Subscription failing = new Subscription() {
+            @Override
+            public void unsubscribe() {
+                throw expected;
+            }
+        };
+        Subscription succeeding = new Subscription() {
+            @Override
+            public void unsubscribe() {
+                cleaned.incrementAndGet();
+            }
+        };
+
+        Subscription composite = failing.and(succeeding);
+        RuntimeException actual = assertThrows(RuntimeException.class, composite::unsubscribe);
+
+        assertSame(expected, actual);
+        assertEquals(1, cleaned.get());
+        assertFalse(composite.isSubscribed());
+    }
+
+    @Test
+    void onceRegistrationUnsubscribesBeforeInvocation() {
+        EventManager events = new EventManager();
+        AtomicInteger calls = new AtomicInteger();
+        events.registerOnce(Ping.class, event -> {
+            calls.incrementAndGet();
+            events.call(new Ping());
+        });
+
+        events.call(new Ping());
+        events.call(new Ping());
+
+        assertEquals(1, calls.get());
+        assertEquals(0, events.handlerCount());
+    }
+
+    @Test
+    void filteredRegistrationOnlyInvokesAcceptedEvents() {
+        EventManager events = new EventManager();
+        AtomicInteger calls = new AtomicInteger();
+        events.registerFiltered(Ping.class, event -> event.accept, event -> calls.incrementAndGet());
+
+        Ping rejected = new Ping();
+        rejected.accept = false;
+        Ping accepted = new Ping();
+        accepted.accept = true;
+        events.call(rejected);
+        events.call(accepted);
+
+        assertEquals(1, calls.get());
+    }
+
+    @Test
+    void metricsTrackDispatchesInvocationsAndFailures() {
+        EventManager events = new EventManager();
+        events.setErrorHandler((event, listener, throwable) -> {
+        });
+        events.register(Ping.class, event -> {
+        });
+        events.register(Ping.class, event -> {
+            throw new IllegalStateException("metrics");
+        });
+
+        events.call(new Ping());
+        EventMetrics metrics = events.metrics();
+        assertEquals(1L, metrics.getDispatchedEvents());
+        assertEquals(2L, metrics.getHandlerInvocations());
+        assertEquals(1L, metrics.getFailures());
+
+        events.resetMetrics();
+        assertEquals(0L, events.metrics().getDispatchedEvents());
+        assertEquals(0L, events.metrics().getHandlerInvocations());
+        assertEquals(0L, events.metrics().getFailures());
+    }
+
+    @Test
+    void metricsCanBeReadPerRuntimeEventType() {
+        EventManager events = new EventManager();
+        events.register(Ping.class, event -> {
+        });
+        events.register(AdminPing.class, event -> {
+        });
+
+        events.call(new Ping());
+        events.call(new AdminPing());
+
+        assertEquals(1L, events.metrics(Ping.class).getDispatchedEvents());
+        assertEquals(1L, events.metrics(Ping.class).getHandlerInvocations());
+        assertEquals(1L, events.metrics(AdminPing.class).getDispatchedEvents());
+        assertEquals(2L, events.metrics(AdminPing.class).getHandlerInvocations());
+    }
+
+    @Test
+    void closeClearsRegistrationsAndIsIdempotent() {
+        EventManager events = new EventManager();
+        events.register(Ping.class, event -> {
+        });
+
+        events.close();
+        events.close();
+
+        assertEquals(0, events.handlerCount());
+        assertFalse(events.hasListeners(Ping.class));
+    }
+
+    @Test
+    void registeredEventTypesReturnsReadOnlySnapshot() {
+        EventManager events = new EventManager();
+        events.register(Ping.class, event -> {
+        });
+
+        java.util.Set<Class<? extends Event>> types = events.registeredEventTypes();
+        assertTrue(types.contains(Ping.class));
+        assertFalse(events.isEmpty());
+        assertThrows(UnsupportedOperationException.class, () -> types.clear());
+
+        events.clear();
+        assertTrue(events.isEmpty());
+        assertTrue(types.contains(Ping.class));
     }
 
     @Test
@@ -433,6 +647,30 @@ class EventManagerTest {
     }
 
     @Test
+    void dispatchSnapshotSkipsHandlersUnregisteredDuringCall() {
+        final EventManager events = new EventManager();
+        final AtomicInteger removed = new AtomicInteger();
+        final AtomicReference<Subscription> later = new AtomicReference<Subscription>();
+
+        events.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping ping) {
+                later.get().unsubscribe();
+            }
+        });
+        later.set(events.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping ping) {
+                removed.incrementAndGet();
+            }
+        }));
+
+        events.call(new Ping());
+
+        assertEquals(0, removed.get());
+    }
+
+    @Test
     void privateHandlersAreInvoked() {
         EventManager events = new EventManager();
         PrivateListener listener = new PrivateListener();
@@ -441,7 +679,127 @@ class EventManagerTest {
         assertEquals(1, listener.getPings());
     }
 
+    @Test
+    void explicitMemberRegistrationRequiresDeclaringClassMatch() throws Exception {
+        EventManager events = new EventManager();
+        CountingListener listener = new CountingListener();
+        Method unrelated = SameSignature.class.getDeclaredMethod("onPing", Ping.class);
+
+        events.register(listener, unrelated);
+        events.call(new Ping());
+
+        assertEquals(0, listener.getPings());
+    }
+
+    @Test
+    void secondSubscribeDoesNotOwnAnExistingRegistration() {
+        EventManager events = new EventManager();
+        CountingListener listener = new CountingListener();
+        Subscription first = events.subscribe(listener);
+        Subscription second = events.subscribe(listener);
+
+        assertTrue(first.isSubscribed());
+        assertFalse(second.isSubscribed());
+        second.unsubscribe();
+        events.call(new Ping());
+        assertEquals(1, listener.getPings());
+
+        first.unsubscribe();
+    }
+
+    @Test
+    void exactAndAssignableClassUnregisterAreDistinct() {
+        EventManager events = new EventManager();
+        ParentListener parent = new ParentListener();
+        ChildListener child = new ChildListener();
+        events.register(parent, child);
+
+        events.unregisterExact(ParentListener.class);
+        events.call(new Ping());
+        assertEquals(0, parent.getParentPings());
+        assertEquals(1, child.getChildPings());
+
+        events.unregisterAssignable(ParentListener.class);
+        events.call(new Ping());
+        assertEquals(1, child.getChildPings());
+    }
+    @Test
+    void mutableFieldListenerUsesCurrentCallback() {
+        EventManager events = new EventManager();
+        MutableFieldListener listener = new MutableFieldListener();
+        events.register(listener);
+
+        events.call(new Ping());
+        listener.onPing = event -> listener.second.incrementAndGet();
+        events.call(new Ping());
+
+        assertEquals(1, listener.first.get());
+        assertEquals(1, listener.second.get());
+    }
+
+    @Test
+    void genericSuperclassFieldListenerTypeIsResolved() {
+        EventManager events = new EventManager();
+        GenericPingListener listener = new GenericPingListener();
+        events.register(listener);
+
+        events.call(new Ping());
+
+        assertEquals(1, listener.calls.get());
+    }
+
+    @Test
+    void handlerScanOrderIsDeterministicForEqualPriority() {
+        EventManager events = new EventManager();
+        OrderedListener listener = new OrderedListener();
+        events.register(listener);
+
+        events.call(new Ping());
+
+        assertEquals(java.util.Arrays.asList("alpha", "zeta"), listener.order);
+    }
+    static final class SameSignature {
+        @EventTarget
+        public void onPing(Ping event) {
+        }
+    }
+
+    static final class MutableFieldListener {
+        private final AtomicInteger first = new AtomicInteger();
+        private final AtomicInteger second = new AtomicInteger();
+
+        @EventTarget
+        private EventListener<Ping> onPing = event -> first.incrementAndGet();
+    }
+
+    static final class OrderedListener {
+        private final List<String> order = new ArrayList<String>();
+
+        @EventTarget
+        public void zeta(Ping event) {
+            order.add("zeta");
+        }
+
+        @EventTarget
+        public void alpha(Ping event) {
+            order.add("alpha");
+        }
+    }
+
+    static class GenericFieldListener<T extends Event> {
+        @EventTarget
+        protected EventListener<T> listener;
+    }
+
+    static final class GenericPingListener extends GenericFieldListener<Ping> {
+        private final AtomicInteger calls = new AtomicInteger();
+
+        GenericPingListener() {
+            listener = event -> calls.incrementAndGet();
+        }
+    }
     static class Ping implements Event {
+        private boolean accept;
     }
 
     static final class AdminPing extends Ping {
@@ -451,6 +809,28 @@ class EventManagerTest {
     }
 
     static final class Halt extends StoppableEvent {
+    }
+
+    static final class BrokenHalt implements Event, dev.hotaru.event.impl.Stoppable {
+        @Override
+        public boolean isStopped() {
+            throw new IllegalStateException("broken stopped state");
+        }
+
+        @Override
+        public void setStopped(boolean state) {
+        }
+    }
+
+    static final class BrokenCancel implements Event, dev.hotaru.event.impl.Cancellable {
+        @Override
+        public boolean isCancelled() {
+            throw new IllegalStateException("broken cancelled state");
+        }
+
+        @Override
+        public void setCancelled(boolean state) {
+        }
     }
 
     static final class Abort extends CancellableStoppableEvent {
