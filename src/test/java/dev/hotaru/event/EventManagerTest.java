@@ -5,23 +5,27 @@ import dev.hotaru.event.impl.CancellableEvent;
 import dev.hotaru.event.impl.CancellableStoppableEvent;
 import dev.hotaru.event.impl.Event;
 import dev.hotaru.event.impl.StoppableEvent;
-import lombok.Getter;
-import lombok.Setter;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -758,6 +762,619 @@ class EventManagerTest {
 
         assertEquals(java.util.Arrays.asList("alpha", "zeta"), listener.order);
     }
+
+    @Test
+    void subscriptionTryWithResourcesClosesAutomatically() {
+        EventManager events = new EventManager();
+        final AtomicInteger calls = new AtomicInteger();
+        try (Subscription sub = events.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping event) {
+                calls.incrementAndGet();
+            }
+        })) {
+            events.call(new Ping());
+            assertEquals(1, calls.get());
+            assertTrue(sub.isSubscribed());
+        }
+        events.call(new Ping());
+        assertEquals(1, calls.get());
+    }
+
+    @Test
+    void asyncDispatchWithoutExplicitExecutorUsesCommonPool() throws Exception {
+        EventManager events = new EventManager();
+        final AtomicInteger calls = new AtomicInteger();
+        events.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping event) {
+                calls.incrementAndGet();
+            }
+        });
+        events.callAsync(new Ping()).get();
+        assertEquals(1, calls.get());
+    }
+
+    @Test
+    void varargsRegisterMultipleEventTypes() {
+        EventManager events = new EventManager();
+        final AtomicInteger calls = new AtomicInteger();
+        Consumer<Event> action = new Consumer<Event>() {
+            @Override
+            public void accept(Event event) {
+                calls.incrementAndGet();
+            }
+        };
+        Subscription sub = events.register(action, Ping.class, Save.class);
+        events.call(new Ping());
+        assertEquals(1, calls.get());
+        events.call(new Save());
+        assertEquals(2, calls.get());
+        sub.unsubscribe();
+        events.call(new Ping());
+        events.call(new Save());
+        assertEquals(2, calls.get());
+    }
+
+    @Test
+    void finalFieldListenerFastPath() {
+        EventManager events = new EventManager();
+        FieldListener listener = new FieldListener();
+        events.register(listener);
+        events.call(new Ping());
+        assertEquals(1, listener.getCalls().get());
+        events.call(new Ping());
+        assertEquals(2, listener.getCalls().get());
+    }
+
+    @Test
+    void metricsCanBeDisabled() {
+        EventManager events = new EventManager();
+        events.setMetricsEnabled(false);
+        events.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping event) {}
+        });
+        events.call(new Ping());
+        EventMetrics m = events.metrics();
+        assertEquals(0, m.getDispatchedEvents());
+        assertEquals(0, m.getHandlerInvocations());
+    }
+
+    @Test
+    void interceptorCanWrapOrShortCircuitDispatch() {
+        EventManager events = new EventManager();
+        AtomicInteger counter = new AtomicInteger();
+        events.register(Ping.class, p -> counter.incrementAndGet());
+
+        AtomicInteger interceptCalls = new AtomicInteger();
+        EventInterceptor interceptor = (event, proceed) -> {
+            interceptCalls.incrementAndGet();
+            proceed.run();
+        };
+
+        events.setInterceptor(interceptor);
+        assertSame(interceptor, events.getInterceptor());
+
+        events.call(new Ping());
+        assertEquals(1, interceptCalls.get());
+        assertEquals(1, counter.get());
+
+        // Short-circuiting interceptor
+        events.setInterceptor((event, proceed) -> {
+            interceptCalls.incrementAndGet();
+            // does NOT call proceed.run()!
+        });
+
+        events.call(new Ping());
+        assertEquals(2, interceptCalls.get());
+        assertEquals(1, counter.get()); // did not increment
+
+        // Removing interceptor
+        events.setInterceptor(null);
+        assertNull(events.getInterceptor());
+        events.call(new Ping());
+        assertEquals(2, counter.get());
+    }
+
+    @Test
+    void weakListenerDeactivatesAfterGarbageCollection() {
+        EventManager events = new EventManager();
+        CountingListener strong = new CountingListener();
+        CountingListener weakTarget = new CountingListener();
+
+        events.register(strong);
+        Subscription weakSub = events.subscribeWeak(weakTarget);
+        assertTrue(weakSub.isSubscribed());
+
+        events.call(new Ping());
+        assertEquals(1, strong.getPings());
+        assertEquals(1, weakTarget.getPings());
+
+        // Keep weak reference to observe GC
+        java.lang.ref.WeakReference<CountingListener> ref = new java.lang.ref.WeakReference<>(weakTarget);
+        weakTarget = null; // drop strong reference
+
+        for (int i = 0; i < 10 && ref.get() != null; i++) {
+            System.gc();
+            System.runFinalization();
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException ignored) {}
+        }
+
+        if (ref.get() == null) {
+            events.call(new Ping());
+            assertEquals(2, strong.getPings());
+            assertFalse(weakSub.isSubscribed());
+        }
+    }
+
+    @Test
+    void subscribeWeakRegistersConsumerWeakly() {
+        EventManager events = new EventManager();
+        AtomicInteger calls = new AtomicInteger();
+        Consumer<Ping> consumer = p -> calls.incrementAndGet();
+
+        Subscription sub = events.subscribeWeak(consumer, Ping.class);
+        assertTrue(sub.isSubscribed());
+        events.call(new Ping());
+        assertEquals(1, calls.get());
+
+        java.lang.ref.WeakReference<Consumer<Ping>> ref = new java.lang.ref.WeakReference<>(consumer);
+        consumer = null;
+
+        for (int i = 0; i < 10 && ref.get() != null; i++) {
+            System.gc();
+            System.runFinalization();
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException ignored) {}
+        }
+
+        if (ref.get() == null) {
+            events.call(new Ping());
+            assertEquals(1, calls.get());
+            assertFalse(sub.isSubscribed());
+        }
+    }
+
+    @Test
+    void unregisterIfRemovesMatchingListeners() {
+        EventManager events = new EventManager();
+        CountingListener listener1 = new CountingListener();
+        CountingListener listener2 = new CountingListener();
+        events.register(listener1);
+        events.register(listener2);
+
+        events.call(new Ping());
+        assertEquals(1, listener1.getPings());
+        assertEquals(1, listener2.getPings());
+
+        events.unregisterIf(target -> target == listener1);
+        events.call(new Ping());
+        assertEquals(1, listener1.getPings());
+        assertEquals(2, listener2.getPings());
+    }
+
+    @Test
+    void unregisterEventTypeRemovesAllHandlersForType() {
+        EventManager events = new EventManager();
+        CountingListener listener = new CountingListener();
+        events.register(listener);
+
+        events.call(new Ping());
+        events.call(new AdminPing());
+        assertEquals(2, listener.getPings()); // AdminPing extends Ping
+        assertEquals(1, listener.getAdminPings());
+
+        events.unregisterEventType(AdminPing.class);
+
+        events.call(new AdminPing());
+        assertEquals(1, listener.getAdminPings());
+        assertEquals(3, listener.getPings()); // Ping handler still receives AdminPing because AdminPing is a Ping
+    }
+
+    @Test
+    void callCancelledReturnsCancelledState() {
+        EventManager events = new EventManager();
+        events.register(Save.class, save -> save.setCancelled(true));
+
+        Save save1 = new Save();
+        assertTrue(events.callCancelled(save1));
+        assertTrue(save1.isCancelled());
+
+        events.unregisterAll();
+        Save save2 = new Save();
+        assertFalse(events.callCancelled(save2));
+        assertFalse(save2.isCancelled());
+    }
+
+    @Test
+    void eventMetricsEqualsAndHashCodeAndToString() {
+        EventMetrics m1 = new EventMetrics(Ping.class, 10, 20, 5);
+        EventMetrics m2 = new EventMetrics(Ping.class, 10, 20, 5);
+        EventMetrics m3 = new EventMetrics(null, 10, 20, 5);
+
+        assertEquals(m1, m2);
+        assertEquals(m1.hashCode(), m2.hashCode());
+        assertNotEquals(m1, m3);
+
+        String str = m1.toString();
+        assertTrue(str.contains("Ping"));
+        assertTrue(str.contains("dispatchedEvents=10"));
+    }
+
+
+    @Test
+    void concurrentRegisterUnregisterAndDispatchStressTest() throws InterruptedException {
+        EventManager events = new EventManager();
+        int threadCount = 8;
+        int operationsPerThread = 1000;
+        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch finishLatch = new CountDownLatch(threadCount);
+        AtomicInteger successfulDispatches = new AtomicInteger();
+        AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+
+        for (int t = 0; t < threadCount; t++) {
+            pool.submit(() -> {
+                try {
+                    startLatch.await();
+                    for (int i = 0; i < operationsPerThread; i++) {
+                        if ((i % 3) == 0) {
+                            Subscription sub = events.registerWeak(Ping.class, p -> {});
+                            if (i % 6 == 0) {
+                                sub.unsubscribe();
+                            }
+                        } else if ((i % 3) == 1) {
+                            events.call(new Ping());
+                            successfulDispatches.incrementAndGet();
+                        } else {
+                            events.unregisterIf(target -> false);
+                        }
+                    }
+                } catch (Throwable t1) {
+                    failure.compareAndSet(null, t1);
+                } finally {
+                    finishLatch.countDown();
+                }
+            });
+        }
+
+        startLatch.countDown();
+        boolean completed = finishLatch.await(10, TimeUnit.SECONDS);
+        pool.shutdownNow();
+
+        assertTrue(completed, "Stress test timed out - potential deadlock detected");
+        assertNull(failure.get(), "Exception thrown during concurrent operations");
+        assertTrue(successfulDispatches.get() > 0);
+    }
+
+    interface MarkerAlpha extends Event {}
+    interface MarkerBeta extends MarkerAlpha {}
+    static class AlphaBetaEvent implements MarkerBeta {}
+
+    @Test
+    void eventHierarchyDispatchesToAllInterfacesAndSuperclasses() {
+        EventManager events = new EventManager();
+        AtomicInteger alphaCount = new AtomicInteger();
+        AtomicInteger betaCount = new AtomicInteger();
+        AtomicInteger directCount = new AtomicInteger();
+
+        events.register(MarkerAlpha.class, e -> alphaCount.incrementAndGet());
+        events.register(MarkerBeta.class, e -> betaCount.incrementAndGet());
+        events.register(AlphaBetaEvent.class, e -> directCount.incrementAndGet());
+
+        events.call(new AlphaBetaEvent());
+        assertEquals(1, directCount.get());
+        assertEquals(1, betaCount.get());
+        assertEquals(1, alphaCount.get());
+    }
+
+    @Test
+    void deadEventDispatchedWhenNoHandlersExist() {
+        EventManager events = new EventManager();
+        List<DeadEvent> deadEvents = new ArrayList<DeadEvent>();
+        events.register(DeadEvent.class, deadEvents::add);
+
+        // Ping has no handlers registered
+        events.call(new Ping());
+
+        assertEquals(1, deadEvents.size());
+        DeadEvent dead = deadEvents.get(0);
+        assertSame(events, dead.getSource());
+        assertTrue(dead.getEvent() instanceof Ping);
+        assertTrue(dead.getTimestamp() > 0);
+        assertTrue(dead.toString().contains("DeadEvent"));
+        assertEquals(dead, new DeadEvent(events, dead.getEvent(), dead.getTimestamp()));
+
+        // When a handler for Ping exists, DeadEvent is NOT dispatched
+        events.register(Ping.class, p -> {});
+        events.call(new Ping());
+        assertEquals(1, deadEvents.size());
+
+        // When deadEventsEnabled is false, DeadEvent is suppressed
+        events.setDeadEventsEnabled(false);
+        assertFalse(events.isDeadEventsEnabled());
+        events.call(new Save());
+        assertEquals(1, deadEvents.size());
+    }
+
+    @Test
+    void eventMetricsTracksTotalAndMaxDurationAndAverage() {
+        EventManager events = new EventManager();
+        events.register(Ping.class, p -> {
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException ignored) {}
+        });
+
+        events.call(new Ping());
+        events.call(new Ping());
+
+        EventMetrics m = events.metrics();
+        assertEquals(2, m.getDispatchedEvents());
+        assertEquals(2, m.getHandlerInvocations());
+        assertTrue(m.getTotalDurationNanos() > 0, "totalDurationNanos should be > 0");
+        assertTrue(m.getMaxDurationNanos() > 0, "maxDurationNanos should be > 0");
+        assertTrue(m.getAverageDurationNanos() > 0.0, "averageDurationNanos should be > 0.0");
+        assertTrue(m.toString().contains("totalDurationNanos"));
+
+        EventMetrics pingM = events.metrics(Ping.class);
+        assertEquals(2, pingM.getDispatchedEvents());
+        assertTrue(pingM.getTotalDurationNanos() > 0);
+
+        events.resetMetrics();
+        EventMetrics resetM = events.metrics();
+        assertEquals(0, resetM.getDispatchedEvents());
+        assertEquals(0, resetM.getTotalDurationNanos());
+        assertEquals(0, resetM.getMaxDurationNanos());
+        assertEquals(0.0, resetM.getAverageDurationNanos());
+    }
+
+    @Test
+    void builderConfiguresEventManagerCorrectly() {
+        EventErrorHandler customHandler = (event, source, t) -> {};
+        EventInterceptor customInterceptor = (event, proceed) -> proceed.run();
+
+        EventManager bus = EventManager.builder()
+                .errorPolicy(ErrorPolicy.STOP)
+                .errorHandler(customHandler)
+                .metricsEnabled(false)
+                .deadEventsEnabled(false)
+                .interceptor(customInterceptor)
+                .build();
+
+        assertEquals(ErrorPolicy.STOP, bus.getErrorPolicy());
+        assertSame(customHandler, bus.getErrorHandler());
+        assertFalse(bus.isMetricsEnabled());
+        assertFalse(bus.isDeadEventsEnabled());
+        assertSame(customInterceptor, bus.getInterceptor());
+    }
+
+    @Test
+    void callAllDispatchesAllEventsInOrder() {
+        EventManager events = new EventManager();
+        List<String> received = new ArrayList<String>();
+        events.register(Ping.class, p -> received.add("ping"));
+        events.register(Save.class, s -> received.add("save"));
+
+        events.callAll(new Ping(), new Save(), new Ping());
+        assertEquals(Arrays.asList("ping", "save", "ping"), received);
+
+        received.clear();
+        events.callAll(Arrays.asList(new Save(), new Ping()));
+        assertEquals(Arrays.asList("save", "ping"), received);
+
+        // Edge case: null or empty
+        events.callAll((Event[]) null);
+        events.callAll((Iterable<Event>) null);
+        assertEquals(Arrays.asList("save", "ping"), received);
+    }
+
+    public static final class PingAcceptedFilter implements EventFilter<Ping> {
+        @Override
+        public boolean test(Ping event) {
+            return event.accept;
+        }
+    }
+
+    public static final class FilteredListener {
+        private final AtomicInteger calls = new AtomicInteger();
+
+        public int getCalls() {
+            return calls.get();
+        }
+
+        @EventTarget(filter = PingAcceptedFilter.class)
+        public void onPing(Ping event) {
+            calls.incrementAndGet();
+        }
+    }
+
+    @Test
+    void eventFilterDeclarativeAnnotationFiltersEvents() {
+        EventManager events = new EventManager();
+        FilteredListener listener = new FilteredListener();
+        events.register(listener);
+
+        Ping rejected = new Ping();
+        rejected.accept = false;
+        events.call(rejected);
+        assertEquals(0, listener.getCalls());
+
+        Ping accepted = new Ping();
+        accepted.accept = true;
+        events.call(accepted);
+        assertEquals(1, listener.getCalls());
+    }
+
+    @Test
+    void interceptorChainingExecutesInPipelineOrder() {
+        EventManager events = new EventManager();
+        List<String> order = new ArrayList<String>();
+
+        events.addInterceptor(new EventInterceptor() {
+            @Override
+            public void intercept(Event event, Runnable proceed) {
+                order.add("A_before");
+                proceed.run();
+                order.add("A_after");
+            }
+        });
+
+        events.addInterceptor(new EventInterceptor() {
+            @Override
+            public void intercept(Event event, Runnable proceed) {
+                order.add("B_before");
+                proceed.run();
+                order.add("B_after");
+            }
+        });
+
+        events.register(Ping.class, p -> order.add("handler"));
+        events.call(new Ping());
+
+        assertEquals(Arrays.asList("A_before", "B_before", "handler", "B_after", "A_after"), order);
+    }
+
+    @Test
+    void threadEnforcementEnforcesDispatchThread() throws InterruptedException {
+        EventManager events = EventManager.builder()
+                .enforceThread(Thread.currentThread())
+                .build();
+
+        // Calling from current thread succeeds
+        events.call(new Ping());
+
+        // Calling from different thread throws IllegalStateException
+        AtomicReference<Throwable> thrown = new AtomicReference<Throwable>();
+        Thread worker = new Thread(() -> {
+            try {
+                events.call(new Ping());
+            } catch (Throwable t) {
+                thrown.set(t);
+            }
+        });
+        worker.start();
+        worker.join();
+
+        assertTrue(thrown.get() instanceof IllegalStateException);
+        assertTrue(thrown.get().getMessage().contains("unauthorized thread"));
+    }
+
+    @Test
+    void childBusBubblesEventsAndCascadesLifecycle() {
+        EventManager parent = new EventManager();
+        EventManager child = parent.createChildBus();
+
+        assertSame(parent, child.getParent());
+        assertTrue(parent.getChildren().contains(child));
+
+        AtomicInteger parentCount = new AtomicInteger();
+        AtomicInteger childCount = new AtomicInteger();
+
+        parent.register(Ping.class, p -> parentCount.incrementAndGet());
+        child.register(Ping.class, p -> childCount.incrementAndGet());
+
+        // Event dispatched on child triggers child AND bubbles to parent
+        child.call(new Ping());
+        assertEquals(1, childCount.get());
+        assertEquals(1, parentCount.get());
+
+        // Event dispatched on parent triggers ONLY parent
+        parent.call(new Ping());
+        assertEquals(1, childCount.get());
+        assertEquals(2, parentCount.get());
+
+        // Child bus close detaches from parent
+        child.close();
+        assertFalse(parent.getChildren().contains(child));
+
+        // Event on detached child no longer bubbles or calls child
+        child.call(new Ping());
+        assertEquals(1, childCount.get());
+        assertEquals(2, parentCount.get());
+
+        // Parent close cascades to all its children
+        EventManager child2 = parent.createChildBus();
+        assertTrue(parent.getChildren().contains(child2));
+        parent.close();
+        assertEquals(0, parent.getChildren().size());
+    }
+
+    @Test
+    void eventFilterCompositionAndOrNegateNot() {
+        EventFilter<Ping> acceptFilter = p -> p.accept;
+        EventFilter<Ping> rejectFilter = EventFilter.not(acceptFilter);
+
+        Ping pingTrue = new Ping();
+        pingTrue.accept = true;
+
+        Ping pingFalse = new Ping();
+        pingFalse.accept = false;
+
+        assertTrue(acceptFilter.test(pingTrue));
+        assertFalse(acceptFilter.test(pingFalse));
+
+        assertFalse(rejectFilter.test(pingTrue));
+        assertTrue(rejectFilter.test(pingFalse));
+
+        EventFilter<Ping> andFilter = acceptFilter.and(p -> p.accept);
+        assertTrue(andFilter.test(pingTrue));
+        assertFalse(andFilter.test(pingFalse));
+
+        EventFilter<Ping> orFilter = acceptFilter.or(p -> !p.accept);
+        assertTrue(orFilter.test(pingTrue));
+        assertTrue(orFilter.test(pingFalse));
+
+        EventFilter<Ping> negated = acceptFilter.negate();
+        assertFalse(negated.test(pingTrue));
+        assertTrue(negated.test(pingFalse));
+    }
+
+    static final class ContextualSubscriber implements EventSubscriber {
+        private int pings;
+        private int adminPings;
+
+        @EventTarget
+        public void onPing(Ping event) {
+            pings++;
+        }
+
+        @EventTarget
+        public void onAdminPing(AdminPing event) {
+            adminPings++;
+        }
+
+        @Override
+        public boolean isHandlingEvents(Event event) {
+            // Opt-out only for AdminPing, allow standard Ping
+            return !(event instanceof AdminPing);
+        }
+    }
+
+    @Test
+    void eventSubscriberContextualHandlingPerEvent() {
+        EventManager events = new EventManager();
+        ContextualSubscriber listener = new ContextualSubscriber();
+        events.register(listener);
+
+        events.call(new Ping());
+        assertEquals(1, listener.pings);
+        assertEquals(0, listener.adminPings);
+
+        events.call(new AdminPing());
+        // AdminPing is rejected by isHandlingEvents(Event)
+        assertEquals(1, listener.pings);
+        assertEquals(0, listener.adminPings);
+    }
+
+
+
+
+
     static final class SameSignature {
         @EventTarget
         public void onPing(Ping event) {
@@ -835,11 +1452,17 @@ class EventManagerTest {
 
     static final class Abort extends CancellableStoppableEvent {
     }
-
-    @Getter
     public static final class CountingListener {
         private int pings;
         private int adminPings;
+
+        public int getPings() {
+            return pings;
+        }
+
+        public int getAdminPings() {
+            return adminPings;
+        }
 
         @EventTarget
         public void onPing(Ping event) {
@@ -852,9 +1475,12 @@ class EventManagerTest {
         }
     }
 
-    @Getter
     public static final class FieldListener {
         private final AtomicInteger calls = new AtomicInteger();
+
+        public AtomicInteger getCalls() {
+            return calls;
+        }
 
         @EventTarget
         private final EventListener<Ping> onPing = new EventListener<Ping>() {
@@ -866,8 +1492,11 @@ class EventManagerTest {
     }
 
     public static final class StaticHandlers {
-        @Getter
         private static final AtomicInteger pings = new AtomicInteger();
+
+        public static AtomicInteger getPings() {
+            return pings;
+        }
 
         @EventTarget
         public static void onPing(Ping event) {
@@ -876,8 +1505,11 @@ class EventManagerTest {
     }
 
     public static final class MoreStaticHandlers {
-        @Getter
         private static final AtomicInteger pings = new AtomicInteger();
+
+        public static AtomicInteger getPings() {
+            return pings;
+        }
 
         @EventTarget
         public static void onPing(Ping event) {
@@ -885,11 +1517,25 @@ class EventManagerTest {
         }
     }
 
-    @Getter
-    @Setter
     public static final class ToggleListener implements EventSubscriber {
         private boolean enabled = true;
         private int pings;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public int getPings() {
+            return pings;
+        }
+
+        public void setPings(int pings) {
+            this.pings = pings;
+        }
 
         @EventTarget
         public void onPing(Ping event) {
@@ -902,9 +1548,12 @@ class EventManagerTest {
         }
     }
 
-    @Getter
     public static class ParentListener {
         private int parentPings;
+
+        public int getParentPings() {
+            return parentPings;
+        }
 
         @EventTarget
         public void onPing(Ping event) {
@@ -912,9 +1561,12 @@ class EventManagerTest {
         }
     }
 
-    @Getter
     public static final class ChildListener extends ParentListener {
         private int childPings;
+
+        public int getChildPings() {
+            return childPings;
+        }
 
         @Override
         @EventTarget
@@ -923,9 +1575,12 @@ class EventManagerTest {
         }
     }
 
-    @Getter
     public static final class PrivateListener {
         private int pings;
+
+        public int getPings() {
+            return pings;
+        }
 
         @EventTarget
         private void onPing(Ping event) {

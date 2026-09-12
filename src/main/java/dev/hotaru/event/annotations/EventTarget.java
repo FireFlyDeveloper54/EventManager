@@ -1,5 +1,6 @@
 package dev.hotaru.event.annotations;
 
+import dev.hotaru.event.EventFilter;
 import dev.hotaru.event.Priority;
 
 import java.lang.annotation.ElementType;
@@ -14,4 +15,6 @@ public @interface EventTarget {
     int value() default Priority.UNSPECIFIED;
 
     boolean ignoreCancelled() default false;
+
+    Class<? extends EventFilter> filter() default EventFilter.PassAll.class;
 }

@@ -18,6 +18,7 @@ import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
 import java.util.ArrayList;
+import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
@@ -32,28 +33,24 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.logging.Level;
+import java.util.logging.Logger;
 
-import lombok.AccessLevel;
-import lombok.AllArgsConstructor;
-import lombok.EqualsAndHashCode;
-import lombok.RequiredArgsConstructor;
-import lombok.SneakyThrows;
-import lombok.experimental.FieldDefaults;
-import lombok.extern.java.Log;
-
-@Log
 public class EventManager implements AutoCloseable {
+    private static final Logger log = Logger.getLogger(EventManager.class.getName());
     private static final int DEFAULT_PRIORITY = Priority.NORMAL;
     private static final Handler[] NO_HANDLERS = new Handler[0];
     private static final MethodHandles.Lookup LOOKUP = MethodHandles.lookup();
 
     private static final Method PRIVATE_LOOKUP_IN = resolvePrivateLookupIn();
+    private static final java.lang.reflect.Constructor<MethodHandles.Lookup> JAVA8_LOOKUP_CTOR = resolveJava8LookupConstructor();
     private static final EventErrorHandler DEFAULT_ERROR_HANDLER = new EventErrorHandler() {
         @Override
         public void handle(Event event, Object listener, Throwable throwable) {
@@ -93,53 +90,167 @@ public class EventManager implements AutoCloseable {
             return result != 0 ? result : left.getType().getName().compareTo(right.getType().getName());
         }
     };
-    private final Map<Class<? extends Event>, Handler[]> eventHandlers = new ConcurrentHashMap<Class<? extends Event>, Handler[]>();
-    private final Map<Class<?>, CachedDispatch> dispatchCache =
-            Collections.synchronizedMap(new java.util.WeakHashMap<Class<?>, CachedDispatch>());
-    private final ClassValue<ConcurrentMap<Method, InvokerFactory>> invokerFactories =
+    private final ConcurrentMap<Class<? extends Event>, Handler[]> eventHandlers =
+            new ConcurrentHashMap<Class<? extends Event>, Handler[]>();
+    private final ConcurrentMap<Class<?>, CachedDispatch> dispatchCache =
+            new ConcurrentHashMap<Class<?>, CachedDispatch>();
+    private static final ClassValue<ConcurrentMap<Method, InvokerFactory>> INVOKER_FACTORIES =
             new ClassValue<ConcurrentMap<Method, InvokerFactory>>() {
                 @Override
                 protected ConcurrentMap<Method, InvokerFactory> computeValue(Class<?> type) {
                     return new ConcurrentHashMap<Method, InvokerFactory>();
                 }
             };
-    private final ClassValue<ListenerPlan> listenerPlans = new ClassValue<ListenerPlan>() {
+    private static final ClassValue<ListenerPlan> LISTENER_PLANS = new ClassValue<ListenerPlan>() {
         @Override
         protected ListenerPlan computeValue(Class<?> type) {
             return buildListenerPlan(type);
         }
     };
-    private final ClassValue<ConcurrentMap<Field, FieldAccessor>> fieldAccessors =
+    private static final ClassValue<ConcurrentMap<Field, FieldAccessor>> FIELD_ACCESSORS =
             new ClassValue<ConcurrentMap<Field, FieldAccessor>>() {
                 @Override
                 protected ConcurrentMap<Field, FieldAccessor> computeValue(Class<?> type) {
                     return new ConcurrentHashMap<Field, FieldAccessor>();
                 }
             };
+    private static final ClassValue<Class<? extends Event>[]> EVENT_HIERARCHIES =
+            new ClassValue<Class<? extends Event>[]>() {
+                @Override
+                protected Class<? extends Event>[] computeValue(Class<?> type) {
+                    LinkedHashSet<Class<? extends Event>> collected = new LinkedHashSet<Class<? extends Event>>();
+                    collectEventHierarchy(type, collected);
+                    @SuppressWarnings("unchecked")
+                    Class<? extends Event>[] array = (Class<? extends Event>[]) collected.toArray(new Class<?>[collected.size()]);
+                    return array;
+                }
+            };
+    private final String name;
+    private final Executor defaultExecutor;
     private final AtomicLong registrationOrder = new AtomicLong();
     private final AtomicLong mutationVersion = new AtomicLong();
-    private final AtomicLong dispatchedEvents = new AtomicLong();
-    private final AtomicLong handlerInvocations = new AtomicLong();
-    private final AtomicLong failures = new AtomicLong();
-    private final Map<Class<?>, MetricCounter> metricsByType =
-            Collections.synchronizedMap(new java.util.WeakHashMap<Class<?>, MetricCounter>());
+    private final LongAdder dispatchedEvents = new LongAdder();
+    private final LongAdder handlerInvocations = new LongAdder();
+    private final LongAdder failures = new LongAdder();
+    private final LongAdder totalDurationNanos = new LongAdder();
+    private final AtomicLong maxDurationNanos = new AtomicLong();
+    private volatile boolean deadEventsEnabled = true;
+    private volatile boolean closed = false;
+    private volatile Predicate<Thread> threadEnforcer;
+    private final EventManager parent;
+    private final Set<EventManager> children = Collections.newSetFromMap(new ConcurrentHashMap<EventManager, Boolean>());
+    private final ConcurrentMap<Class<?>, MetricCounter> metricsByType =
+            new ConcurrentHashMap<Class<?>, MetricCounter>();
+
+    private static final ClassValue<EventFilter<Event>> FILTER_CACHE =
+            new ClassValue<EventFilter<Event>>() {
+                @SuppressWarnings("unchecked")
+                @Override
+                protected EventFilter<Event> computeValue(Class<?> type) {
+                    try {
+                        java.lang.reflect.Constructor<?> constructor = type.getDeclaredConstructor();
+                        constructor.setAccessible(true);
+                        return (EventFilter<Event>) constructor.newInstance();
+                    } catch (Throwable t) {
+                        throw new IllegalArgumentException("Failed to instantiate EventFilter: " + type, t);
+                    }
+                }
+            };
+
+    @SuppressWarnings("unchecked")
+    private static EventFilter<Event> filterFor(Class<? extends EventFilter> filterClass) {
+        if (filterClass == null || filterClass == EventFilter.PassAll.class) {
+            return null;
+        }
+        return FILTER_CACHE.get(filterClass);
+    }
+    private volatile boolean metricsEnabled = true;
     private volatile EventErrorHandler errorHandler = DEFAULT_ERROR_HANDLER;
     private volatile ErrorPolicy errorPolicy = ErrorPolicy.CONTINUE;
+    private volatile EventInterceptor interceptor;
 
     public EventManager() {
+        this("EventManager", null, null, null, null);
+    }
+
+    public EventManager(String name) {
+        this(name, null, null, null, null);
+    }
+
+    public EventManager(EventManager parent) {
+        this(parent != null ? parent.getName() + "-child" : "EventManager-child", parent, null, null, null);
     }
 
     public EventManager(EventErrorHandler errorHandler) {
-        this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
+        this("EventManager", null, errorHandler, null, null);
     }
 
     public EventManager(EventErrorHandler errorHandler, ErrorPolicy errorPolicy) {
+        this("EventManager", null, errorHandler, errorPolicy, null);
+    }
+
+    public EventManager(EventManager parent, EventErrorHandler errorHandler, ErrorPolicy errorPolicy) {
+        this(parent != null ? parent.getName() + "-child" : "EventManager-child", parent, errorHandler, errorPolicy, null);
+    }
+
+    public EventManager(String name, EventManager parent, EventErrorHandler errorHandler, ErrorPolicy errorPolicy, Executor defaultExecutor) {
+        this.name = (name != null && !name.trim().isEmpty()) ? name.trim() : "EventManager";
+        this.parent = parent;
         this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
         this.errorPolicy = errorPolicy != null ? errorPolicy : ErrorPolicy.CONTINUE;
+        this.defaultExecutor = defaultExecutor != null ? defaultExecutor : ForkJoinPool.commonPool();
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public Executor getDefaultExecutor() {
+        return defaultExecutor;
+    }
+
+    /**
+     * Creates a scoped child event bus.
+     * Events dispatched on the child bus will trigger child listeners first,
+     * then bubble up to this parent bus (unless cancelled or stopped).
+     */
+    public EventManager createChildBus() {
+        return createChildBus(this.name + "-child");
+    }
+
+    public EventManager createChildBus(String childName) {
+        if (closed) {
+            throw new IllegalStateException("Cannot create child bus from closed parent event manager");
+        }
+        EventManager child = new EventManager(childName, this, this.errorHandler, this.errorPolicy, this.defaultExecutor);
+        child.setMetricsEnabled(this.metricsEnabled);
+        child.setDeadEventsEnabled(this.deadEventsEnabled);
+        children.add(child);
+        return child;
+    }
+
+    public EventManager getParent() {
+        return parent;
+    }
+
+    public Set<EventManager> getChildren() {
+        return Collections.unmodifiableSet(new HashSet<EventManager>(children));
+    }
+
+    public boolean isMetricsEnabled() {
+        return metricsEnabled;
+    }
+
+    public void setMetricsEnabled(boolean metricsEnabled) {
+        this.metricsEnabled = metricsEnabled;
     }
 
     public void setErrorHandler(EventErrorHandler errorHandler) {
         this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
+    }
+
+    public EventErrorHandler getErrorHandler() {
+        return errorHandler;
     }
 
     public ErrorPolicy getErrorPolicy() {
@@ -150,36 +261,107 @@ public class EventManager implements AutoCloseable {
         this.errorPolicy = errorPolicy != null ? errorPolicy : ErrorPolicy.CONTINUE;
     }
 
-    /** Returns a lock-free snapshot of dispatch counters. */
+    public EventInterceptor getInterceptor() {
+        return interceptor;
+    }
+
+    public void setInterceptor(EventInterceptor interceptor) {
+        this.interceptor = interceptor;
+    }
+
+    /**
+     * Appends an interceptor to the current interceptor chain.
+     */
+    public synchronized void addInterceptor(EventInterceptor interceptor) {
+        if (interceptor == null) {
+            return;
+        }
+        this.interceptor = EventInterceptors.chain(this.interceptor, interceptor);
+    }
+
+    public void enforceThread(final Thread expectedThread) {
+        if (expectedThread == null) {
+            this.threadEnforcer = null;
+        } else {
+            this.threadEnforcer = new Predicate<Thread>() {
+                @Override
+                public boolean test(Thread thread) {
+                    return thread == expectedThread;
+                }
+            };
+        }
+    }
+
+    public void enforceThread(Predicate<Thread> threadEnforcer) {
+        this.threadEnforcer = threadEnforcer;
+    }
+
+    public Predicate<Thread> getThreadEnforcer() {
+        return threadEnforcer;
+    }
+
+    private void checkThreadAffinity(Event event) {
+        Predicate<Thread> enforcer = this.threadEnforcer;
+        if (enforcer != null && !enforcer.test(Thread.currentThread())) {
+            throw new IllegalStateException("Event " + (event != null ? event.getClass().getName() : "null")
+                    + " dispatched on unauthorized thread: " + Thread.currentThread().getName());
+        }
+    }
+
+    public boolean isDeadEventsEnabled() {
+        return deadEventsEnabled;
+    }
+
+    public boolean isClosed() {
+        return closed;
+    }
+
+    public void setDeadEventsEnabled(boolean deadEventsEnabled) {
+        this.deadEventsEnabled = deadEventsEnabled;
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    /** Returns a lock-free snapshot of dispatch counters and latency profile. */
     public EventMetrics metrics() {
-        return new EventMetrics(dispatchedEvents.get(), handlerInvocations.get(), failures.get());
+        return new EventMetrics(null, dispatchedEvents.sum(), handlerInvocations.sum(),
+                failures.sum(), totalDurationNanos.sum(), maxDurationNanos.get());
     }
 
     /** Returns counters for one runtime event type without retaining its class loader forever. */
     public EventMetrics metrics(Class<? extends Event> eventType) {
         if (eventType == null) {
-            return new EventMetrics(null, 0L, 0L, 0L);
+            return new EventMetrics(null, 0L, 0L, 0L, 0L, 0L);
         }
-        MetricCounter counter;
-        synchronized (metricsByType) {
-            counter = metricsByType.get(eventType);
-        }
+        MetricCounter counter = metricsByType.get(eventType);
         return counter == null
-                ? new EventMetrics(eventType, 0L, 0L, 0L)
+                ? new EventMetrics(eventType, 0L, 0L, 0L, 0L, 0L)
                 : counter.snapshot(eventType);
     }
 
     /** Resets dispatch counters without changing registrations. */
     public void resetMetrics() {
-        dispatchedEvents.set(0L);
-        handlerInvocations.set(0L);
-        failures.set(0L);
+        dispatchedEvents.reset();
+        handlerInvocations.reset();
+        failures.reset();
+        totalDurationNanos.reset();
+        maxDurationNanos.set(0L);
         metricsByType.clear();
     }
 
-    /** Clears all registrations and cached dispatch plans. Safe to call repeatedly. */
+    /** Clears all registrations, closes child buses, and detaches from parent. Safe to call repeatedly. */
     @Override
     public void close() {
+        closed = true;
+        if (parent != null) {
+            parent.children.remove(this);
+        }
+        for (EventManager child : new ArrayList<EventManager>(children)) {
+            child.close();
+        }
+        children.clear();
         clear();
     }
 
@@ -200,11 +382,55 @@ public class EventManager implements AutoCloseable {
         if (listener == null) {
             return;
         }
+        if (listener instanceof Consumer<?>) {
+            if (eventClass == null) {
+                return;
+            }
+            @SuppressWarnings("unchecked")
+            Consumer<Event> consumer = (Consumer<Event>) listener;
+            @SuppressWarnings("unchecked")
+            Class<Event> evt = (Class<Event>) eventClass;
+            register(evt, consumer);
+            return;
+        }
         if (listener instanceof Class<?>) {
             register((Class<?>) listener, eventClass);
             return;
         }
-        bindListenerPlan(listener, listenerPlanFor(listener.getClass()), eventClass, false);
+        bindListenerPlan(listener, listenerPlanFor(listener.getClass()), eventClass, false, false);
+    }
+
+    /**
+     * Registers an object listener using a weak reference to prevent memory leaks.
+     * When the listener is garbage collected, its handlers will automatically deactivate.
+     */
+    public void registerWeak(Object listener) {
+        registerWeak(listener, (Class<? extends Event>) null);
+    }
+
+    /**
+     * Registers an object listener weakly for a specific event class.
+     */
+    public void registerWeak(Object listener, Class<? extends Event> eventClass) {
+        if (listener == null) {
+            return;
+        }
+        if (listener instanceof Consumer<?>) {
+            if (eventClass == null) {
+                return;
+            }
+            @SuppressWarnings("unchecked")
+            Consumer<Event> consumer = (Consumer<Event>) listener;
+            @SuppressWarnings("unchecked")
+            Class<Event> evt = (Class<Event>) eventClass;
+            registerWeak(evt, consumer);
+            return;
+        }
+        if (listener instanceof Class<?>) {
+            register((Class<?>) listener, eventClass);
+            return;
+        }
+        bindListenerPlan(listener, listenerPlanFor(listener.getClass()), eventClass, false, true);
     }
 
     public void register(Class<?> listenerClass) {
@@ -342,6 +568,47 @@ public class EventManager implements AutoCloseable {
         return new HandlerSubscription(handler);
     }
 
+    public <T extends Event> Subscription registerWeak(Class<T> eventType, Consumer<? super T> action) {
+        return registerWeak(eventType, DEFAULT_PRIORITY, false, action);
+    }
+
+    public <T extends Event> Subscription registerWeak(Class<T> eventType, int priority, Consumer<? super T> action) {
+        return registerWeak(eventType, priority, false, action);
+    }
+
+    public <T extends Event> Subscription registerWeak(final Class<T> eventType, int priority,
+                                                       boolean ignoreCancelled, final Consumer<? super T> action) {
+        if (eventType == null || action == null) {
+            return Subscription.NOOP;
+        }
+
+        final WeakReference<Consumer<? super T>> weakRef = new WeakReference<Consumer<? super T>>(action);
+        final Handler handler = new Handler(
+                action,
+                true,
+                null,
+                null,
+                null,
+                eventType,
+                normalizePriority(priority),
+                ignoreCancelled,
+                registrationOrder.getAndIncrement(),
+                false,
+                null,
+                new Invoker() {
+                    @Override
+                    public void invoke(Event event) {
+                        Consumer<? super T> target = weakRef.get();
+                        if (target != null) {
+                            target.accept(eventType.cast(event));
+                        }
+                    }
+                }
+        );
+        addHandler(handler);
+        return new HandlerSubscription(handler);
+    }
+
     public <T extends Event> Subscription registerListener(Class<T> eventType,
                                                            EventListener<? super T> listener) {
         if (eventType == null || listener == null) {
@@ -439,6 +706,7 @@ public class EventManager implements AutoCloseable {
             int priority, boolean ignoreCancelled, EventListener<? super T> listener,
             Class<? extends T>... eventTypes) {
         if (listener == null || eventTypes == null || eventTypes.length == 0) {
+
             return Subscription.NOOP;
         }
 
@@ -448,6 +716,37 @@ public class EventManager implements AutoCloseable {
         for (Class<? extends T> eventType : uniqueTypes) {
             if (eventType != null) {
                 subscriptions.add(registerListener(eventType, priority, ignoreCancelled, listener));
+            }
+        }
+        return Subscriptions.combine(subscriptions.toArray(new Subscription[subscriptions.size()]));
+    }
+
+    @SafeVarargs
+    public final <T extends Event> Subscription register(
+            Consumer<? super T> action, Class<? extends T>... eventTypes) {
+        return register(DEFAULT_PRIORITY, false, action, eventTypes);
+    }
+
+    @SafeVarargs
+    public final <T extends Event> Subscription register(
+            int priority, Consumer<? super T> action, Class<? extends T>... eventTypes) {
+        return register(priority, false, action, eventTypes);
+    }
+
+    @SafeVarargs
+    public final <T extends Event> Subscription register(
+            int priority, boolean ignoreCancelled, Consumer<? super T> action,
+            Class<? extends T>... eventTypes) {
+        if (action == null || eventTypes == null || eventTypes.length == 0) {
+            return Subscription.NOOP;
+        }
+
+        Set<Class<? extends T>> uniqueTypes = new LinkedHashSet<Class<? extends T>>();
+        Collections.addAll(uniqueTypes, eventTypes);
+        List<Subscription> subscriptions = new ArrayList<Subscription>(uniqueTypes.size());
+        for (Class<? extends T> eventType : uniqueTypes) {
+            if (eventType != null) {
+                subscriptions.add(register(eventType, priority, ignoreCancelled, action));
             }
         }
         return Subscriptions.combine(subscriptions.toArray(new Subscription[subscriptions.size()]));
@@ -486,6 +785,13 @@ public class EventManager implements AutoCloseable {
         if (listener == null || eventClass == null) {
             return Subscription.NOOP;
         }
+        if (listener instanceof Consumer<?>) {
+            @SuppressWarnings("unchecked")
+            Consumer<Event> consumer = (Consumer<Event>) listener;
+            @SuppressWarnings("unchecked")
+            Class<Event> evt = (Class<Event>) eventClass;
+            return register(evt, consumer);
+        }
         synchronized (this) {
             if (isRegistered(listener, eventClass)) {
                 return Subscription.NOOP;
@@ -494,6 +800,52 @@ public class EventManager implements AutoCloseable {
                 register((Class<?>) listener, eventClass);
             } else {
                 register(listener, eventClass);
+            }
+            return ownedSubscription(handlersForListener(listener, eventClass));
+        }
+    }
+
+    /**
+     * Subscribes an object listener weakly, returning a subscription.
+     */
+    public Subscription subscribeWeak(Object listener) {
+        if (listener == null) {
+            return Subscription.NOOP;
+        }
+        if (listener instanceof Class<?>) {
+            return subscribe((Class<?>) listener);
+        }
+        synchronized (this) {
+            if (isRegistered(listener)) {
+                return Subscription.NOOP;
+            }
+            registerWeak(listener);
+            return ownedSubscription(handlersForListener(listener, null));
+        }
+    }
+
+    /**
+     * Subscribes an object listener weakly for a specific event class.
+     */
+    public Subscription subscribeWeak(Object listener, Class<? extends Event> eventClass) {
+        if (listener == null || eventClass == null) {
+            return Subscription.NOOP;
+        }
+        if (listener instanceof Consumer<?>) {
+            @SuppressWarnings("unchecked")
+            Consumer<Event> consumer = (Consumer<Event>) listener;
+            @SuppressWarnings("unchecked")
+            Class<Event> evt = (Class<Event>) eventClass;
+            return registerWeak(evt, consumer);
+        }
+        synchronized (this) {
+            if (isRegistered(listener, eventClass)) {
+                return Subscription.NOOP;
+            }
+            if (listener instanceof Class<?>) {
+                register((Class<?>) listener, eventClass);
+            } else {
+                registerWeak(listener, eventClass);
             }
             return ownedSubscription(handlersForListener(listener, eventClass));
         }
@@ -514,7 +866,7 @@ public class EventManager implements AutoCloseable {
         removeHandlers(new Predicate<Handler>() {
             @Override
             public boolean test(Handler handler) {
-                return handler.listener == listener;
+                return handler.matchesListener(listener);
             }
         });
     }
@@ -527,7 +879,7 @@ public class EventManager implements AutoCloseable {
             unregister((Class<?>) listener, eventClass);
             return;
         }
-        removeHandlers(new Predicate<Handler>() {
+        removeHandlers(eventClass, new Predicate<Handler>() {
             @Override
             public boolean test(Handler handler) {
                 return handler.listener == listener && handler.eventType == eventClass;
@@ -590,7 +942,7 @@ public class EventManager implements AutoCloseable {
         if (listenerClass == null || eventClass == null) {
             return;
         }
-        removeHandlers(new Predicate<Handler>() {
+        removeHandlers(eventClass, new Predicate<Handler>() {
             @Override
             public boolean test(Handler handler) {
                 if (handler.eventType != eventClass) {
@@ -623,7 +975,7 @@ public class EventManager implements AutoCloseable {
         if (listenerClass == null || eventClass == null) {
             return;
         }
-        removeHandlers(new Predicate<Handler>() {
+        removeHandlers(eventClass, new Predicate<Handler>() {
             @Override
             public boolean test(Handler handler) {
                 return handler.eventType == eventClass
@@ -632,6 +984,64 @@ public class EventManager implements AutoCloseable {
                         && listenerClass == handler.listener.getClass()));
             }
         });
+    }
+
+    /**
+     * Unregisters all handlers whose listener matches the supplied predicate.
+     */
+    public void unregisterIf(final Predicate<Object> listenerPredicate) {
+        if (listenerPredicate == null) {
+            return;
+        }
+        removeHandlers(new Predicate<Handler>() {
+            @Override
+            public boolean test(Handler handler) {
+                Object l = handler.getListener();
+                return l != null && listenerPredicate.test(l);
+            }
+        });
+    }
+
+    /**
+     * Unregisters all handlers registered for the specified event type.
+     */
+    public void unregisterEventType(final Class<? extends Event> eventType) {
+        if (eventType == null) {
+            return;
+        }
+        removeHandlers(eventType, new Predicate<Handler>() {
+            @Override
+            public boolean test(Handler handler) {
+                return handler.eventType == eventType;
+            }
+        });
+    }
+
+    public void unregisterAll() {
+        clear();
+    }
+
+    /**
+     * Actively scans all registered event types and purges any handlers whose
+     * weak listener targets have been garbage collected.
+     *
+     * @return the total count of dead handlers purged from the bus
+     */
+    public int purgeDeadHandlers() {
+        final AtomicInteger purged = new AtomicInteger();
+        for (Class<? extends Event> eventType : eventHandlers.keySet()) {
+            removeHandlers(eventType, new Predicate<Handler>() {
+                @Override
+                public boolean test(Handler handler) {
+                    if (handler.isWeak() && handler.isDead()) {
+                        purged.incrementAndGet();
+                        return true;
+                    }
+                    return false;
+                }
+            });
+        }
+        return purged.get();
     }
 
     public void clear() {
@@ -671,7 +1081,7 @@ public class EventManager implements AutoCloseable {
         }
         for (Handler[] handlers : eventHandlers.values()) {
             for (int i = 0; i < handlers.length; i++) {
-                if (handlers[i].listener == listener) {
+                if (handlers[i].matchesListener(listener)) {
                     return true;
                 }
             }
@@ -699,7 +1109,7 @@ public class EventManager implements AutoCloseable {
             return false;
         }
         for (int i = 0; i < handlers.length; i++) {
-            if (handlers[i].listener == listener) {
+            if (handlers[i].matchesListener(listener)) {
                 return true;
             }
         }
@@ -770,19 +1180,52 @@ public class EventManager implements AutoCloseable {
     }
 
     public <T extends Event> T call(T event) {
-        if (event == null) {
-            return null;
-        }
-
-        dispatchedEvents.incrementAndGet();
-        recordDispatch(event.getClass());
-
-        Handler[] handlers = handlersFor(event.getClass());
-        if (handlers.length == 0) {
+        if (event == null || closed) {
             return event;
         }
 
-        dispatch(event, handlers);
+        checkThreadAffinity(event);
+
+        long startNanos = metricsEnabled ? System.nanoTime() : 0L;
+        if (metricsEnabled) {
+            dispatchedEvents.increment();
+            recordDispatch(event.getClass());
+        }
+
+        Handler[] handlers = handlersFor(event.getClass());
+        if (handlers.length == 0) {
+            if (metricsEnabled) {
+                recordDuration(event.getClass(), System.nanoTime() - startNanos);
+            }
+            if (parent != null) {
+                parent.call(event);
+            } else if (deadEventsEnabled && !(event instanceof DeadEvent) && hasListeners(DeadEvent.class)) {
+                call(new DeadEvent(this, event));
+            }
+            return event;
+        }
+
+        try {
+            dispatch(event, handlers);
+        } finally {
+            if (metricsEnabled) {
+                recordDuration(event.getClass(), System.nanoTime() - startNanos);
+            }
+        }
+
+        if (parent != null) {
+            boolean canBubble = true;
+            if (event instanceof Cancellable && ((Cancellable) event).isCancelled()) {
+                canBubble = false;
+            }
+            if (event instanceof Stoppable && ((Stoppable) event).isStopped()) {
+                canBubble = false;
+            }
+            if (canBubble) {
+                parent.call(event);
+            }
+        }
+
         return event;
     }
 
@@ -800,16 +1243,36 @@ public class EventManager implements AutoCloseable {
     }
 
     public <T extends Event> T callExact(T event) {
-        if (event == null) {
-            return null;
+        if (event == null || closed) {
+            return event;
         }
 
-        dispatchedEvents.incrementAndGet();
-        recordDispatch(event.getClass());
+        checkThreadAffinity(event);
+
+        long startNanos = metricsEnabled ? System.nanoTime() : 0L;
+        if (metricsEnabled) {
+            dispatchedEvents.increment();
+            recordDispatch(event.getClass());
+        }
 
         Handler[] handlers = exactHandlersFor(event.getClass());
         if (handlers.length != 0) {
-            dispatch(event, handlers);
+            try {
+                dispatch(event, handlers);
+            } finally {
+                if (metricsEnabled) {
+                    recordDuration(event.getClass(), System.nanoTime() - startNanos);
+                }
+            }
+        } else {
+            if (metricsEnabled) {
+                recordDuration(event.getClass(), System.nanoTime() - startNanos);
+            }
+            if (parent != null) {
+                parent.callExact(event);
+            } else if (deadEventsEnabled && !(event instanceof DeadEvent) && hasListeners(DeadEvent.class)) {
+                call(new DeadEvent(this, event));
+            }
         }
         return event;
     }
@@ -828,11 +1291,65 @@ public class EventManager implements AutoCloseable {
     }
 
     /**
+     * Dispatches a cancellable event and returns whether it was cancelled.
+     */
+    public <T extends Event & Cancellable> boolean callCancelled(T event) {
+        if (event == null) {
+            return false;
+        }
+        call(event);
+        return event.isCancelled();
+    }
+
+    /**
+     * Dispatches multiple events in sequential order.
+     */
+    public void callAll(Event... events) {
+        if (events == null || events.length == 0) {
+            return;
+        }
+        for (int i = 0; i < events.length; i++) {
+            Event event = events[i];
+            if (event != null) {
+                call(event);
+            }
+        }
+    }
+
+    /**
+     * Dispatches an iterable collection of events in sequential order.
+     */
+    public void callAll(Iterable<? extends Event> events) {
+        if (events == null) {
+            return;
+        }
+        for (Event event : events) {
+            if (event != null) {
+                call(event);
+            }
+        }
+    }
+
+    /**
+     * Dispatches an event asynchronously using ForkJoinPool.commonPool().
+     */
+    public <T extends Event> CompletableFuture<T> callAsync(final T event) {
+        return callAsync(event, this.defaultExecutor);
+    }
+
+    /**
      * Dispatches an event through the supplied executor. The returned future
      * completes with the same event instance after dispatch finishes.
      */
     public <T extends Event> CompletableFuture<T> callAsync(final T event, Executor executor) {
         return submit(event, executor, false);
+    }
+
+    /**
+     * Dispatches an event to exact-type handlers asynchronously using ForkJoinPool.commonPool().
+     */
+    public <T extends Event> CompletableFuture<T> callExactAsync(final T event) {
+        return callExactAsync(event, this.defaultExecutor);
     }
 
     /**
@@ -884,7 +1401,78 @@ public class EventManager implements AutoCloseable {
         return callExact(supplier.get());
     }
 
-    private void dispatch(Event event, Handler[] handlers) {
+    private static final class DispatchFrame implements Runnable {
+        private EventManager bus;
+        private Event event;
+        private Handler[] handlers;
+        private DispatchFrame next;
+
+        private void init(EventManager bus, Event event, Handler[] handlers) {
+            this.bus = bus;
+            this.event = event;
+            this.handlers = handlers;
+        }
+
+        private void clear() {
+            this.bus = null;
+            this.event = null;
+            this.handlers = null;
+        }
+
+        @Override
+        public void run() {
+            EventManager targetBus = this.bus;
+            if (targetBus != null) {
+                targetBus.doDispatch(event, handlers);
+            }
+        }
+    }
+
+    private static final class FramePool {
+        private DispatchFrame head = new DispatchFrame();
+
+        private DispatchFrame acquire(EventManager bus, Event event, Handler[] handlers) {
+            DispatchFrame frame = head;
+            if (frame == null) {
+                frame = new DispatchFrame();
+            } else {
+                head = frame.next;
+                frame.next = null;
+            }
+            frame.init(bus, event, handlers);
+            return frame;
+        }
+
+        private void release(DispatchFrame frame) {
+            frame.clear();
+            frame.next = head;
+            head = frame;
+        }
+    }
+
+    private static final ThreadLocal<FramePool> FRAME_POOLS = new ThreadLocal<FramePool>() {
+        @Override
+        protected FramePool initialValue() {
+            return new FramePool();
+        }
+    };
+
+    private void dispatch(final Event event, final Handler[] handlers) {
+        EventInterceptor currentInterceptor = this.interceptor;
+        if (currentInterceptor != null) {
+            FramePool pool = FRAME_POOLS.get();
+            DispatchFrame frame = pool.acquire(this, event, handlers);
+            try {
+                currentInterceptor.intercept(event, frame);
+            } finally {
+                pool.release(frame);
+            }
+        } else {
+            doDispatch(event, handlers);
+        }
+    }
+
+    private void doDispatch(Event event, Handler[] handlers) {
         Cancellable cancellable = event instanceof Cancellable ? (Cancellable) event : null;
         Stoppable stoppable = event instanceof Stoppable ? (Stoppable) event : null;
         boolean stoppableReadable = true;
@@ -917,7 +1505,7 @@ public class EventManager implements AutoCloseable {
 
             boolean handling;
             try {
-                handling = handler.isHandlingEvents();
+                handling = handler.isHandlingEvents(event);
             } catch (Throwable t) {
                 if (!handleFailure(event, handler.listener, t)) return;
                 continue;
@@ -957,15 +1545,18 @@ public class EventManager implements AutoCloseable {
 
             try {
                 if (handler.once) {
-                    removeHandlers(new Predicate<Handler>() {
+                    handler.active = false;
+                    removeHandlers(handler.eventType, new Predicate<Handler>() {
                         @Override
                         public boolean test(Handler candidate) {
                             return candidate == handler;
                         }
                     });
                 }
-                handlerInvocations.incrementAndGet();
-                recordInvocation(event.getClass());
+                if (metricsEnabled) {
+                    handlerInvocations.increment();
+                    recordInvocation(event.getClass());
+                }
                 handler.invoke(event);
             } catch (Throwable t) {
                 if (!handleFailure(event, handler.listener, t)) return;
@@ -974,8 +1565,10 @@ public class EventManager implements AutoCloseable {
     }
 
     private boolean handleFailure(Event event, Object source, Throwable throwable) {
-        failures.incrementAndGet();
-        recordFailure(event == null ? null : event.getClass());
+        if (metricsEnabled) {
+            failures.increment();
+            recordFailure(event == null ? null : event.getClass());
+        }
         try {
             errorHandler.handle(event, source, throwable);
         } catch (Throwable errorHandlerFailure) {
@@ -993,29 +1586,42 @@ public class EventManager implements AutoCloseable {
         if (eventType == null) {
             return null;
         }
-        synchronized (metricsByType) {
-            MetricCounter counter = metricsByType.get(eventType);
-            if (counter == null) {
-                counter = new MetricCounter();
-                metricsByType.put(eventType, counter);
-            }
-            return counter;
+        MetricCounter counter = metricsByType.get(eventType);
+        if (counter == null) {
+            MetricCounter created = new MetricCounter();
+            MetricCounter previous = metricsByType.putIfAbsent(eventType, created);
+            counter = previous != null ? previous : created;
         }
+        return counter;
     }
 
     private void recordDispatch(Class<?> eventType) {
         MetricCounter counter = counterFor(eventType);
-        if (counter != null) counter.dispatchedEvents.incrementAndGet();
+        if (counter != null) counter.dispatchedEvents.increment();
     }
 
     private void recordInvocation(Class<?> eventType) {
         MetricCounter counter = counterFor(eventType);
-        if (counter != null) counter.handlerInvocations.incrementAndGet();
+        if (counter != null) counter.handlerInvocations.increment();
     }
 
     private void recordFailure(Class<?> eventType) {
         MetricCounter counter = counterFor(eventType);
-        if (counter != null) counter.failures.incrementAndGet();
+        if (counter != null) counter.failures.increment();
+    }
+
+    private void recordDuration(Class<?> eventType, long nanos) {
+        totalDurationNanos.add(nanos);
+        long currentMax;
+        while (nanos > (currentMax = maxDurationNanos.get())) {
+            if (maxDurationNanos.compareAndSet(currentMax, nanos)) {
+                break;
+            }
+        }
+        MetricCounter counter = counterFor(eventType);
+        if (counter != null) {
+            counter.recordDuration(nanos);
+        }
     }
 
     private static RuntimeException propagate(Event event, Object source, Throwable throwable) {
@@ -1045,9 +1651,53 @@ public class EventManager implements AutoCloseable {
         return handlers == null ? NO_HANDLERS : handlers;
     }
 
+    private static void collectEventHierarchy(Class<?> type, Set<Class<? extends Event>> collected) {
+        if (type == null || type == Object.class || !Event.class.isAssignableFrom(type)) {
+            return;
+        }
+        @SuppressWarnings("unchecked")
+        Class<? extends Event> eventType = (Class<? extends Event>) type;
+        if (!collected.add(eventType)) {
+            return;
+        }
+        for (Class<?> iface : type.getInterfaces()) {
+            collectEventHierarchy(iface, collected);
+        }
+        collectEventHierarchy(type.getSuperclass(), collected);
+    }
+
     private Handler[] buildDispatchList(Class<?> eventClass) {
+        Class<? extends Event>[] hierarchy = EVENT_HIERARCHIES.get(eventClass);
+        if (hierarchy.length == 0) {
+            return NO_HANDLERS;
+        }
+
+        int matchingTypes = 0;
+        Class<? extends Event> singleType = null;
+        for (int i = 0; i < hierarchy.length; i++) {
+            if (eventHandlers.containsKey(hierarchy[i])) {
+                matchingTypes++;
+                singleType = hierarchy[i];
+            }
+        }
+
+        if (matchingTypes == 0) {
+            return NO_HANDLERS;
+        }
+        if (matchingTypes == 1) {
+            Handler[] handlers = eventHandlers.get(singleType);
+            return (handlers == null || handlers.length == 0) ? NO_HANDLERS : handlers;
+        }
+
         LinkedHashSet<Handler> collected = new LinkedHashSet<Handler>();
-        collectHandlers(eventClass, collected, new HashSet<Class<?>>());
+        for (int i = 0; i < hierarchy.length; i++) {
+            Handler[] handlers = eventHandlers.get(hierarchy[i]);
+            if (handlers != null) {
+                for (int j = 0; j < handlers.length; j++) {
+                    collected.add(handlers[j]);
+                }
+            }
+        }
 
         if (collected.isEmpty()) {
             return NO_HANDLERS;
@@ -1058,18 +1708,18 @@ public class EventManager implements AutoCloseable {
         return handlers.toArray(NO_HANDLERS);
     }
 
-    private ListenerPlan listenerPlanFor(final Class<?> listenerClass) {
-        return listenerPlans.get(listenerClass);
+    private static ListenerPlan listenerPlanFor(final Class<?> listenerClass) {
+        return LISTENER_PLANS.get(listenerClass);
     }
 
-    private ListenerPlan buildListenerPlan(Class<?> listenerClass) {
+    private static ListenerPlan buildListenerPlan(Class<?> listenerClass) {
         List<HandlerDefinition> definitions = new ArrayList<HandlerDefinition>();
         scanListenerType(listenerClass, definitions, new HashSet<Class<?>>(),
                 new java.util.HashMap<MethodSignature, List<Method>>(), listenerClass);
         return new ListenerPlan(definitions.toArray(new HandlerDefinition[definitions.size()]));
     }
 
-    private void scanListenerType(Class<?> type, List<HandlerDefinition> definitions,
+    private static void scanListenerType(Class<?> type, List<HandlerDefinition> definitions,
                                    Set<Class<?>> visitedTypes,
                                    Map<MethodSignature, List<Method>> seenMethods,
                                    Class<?> concreteListenerClass) {
@@ -1113,11 +1763,19 @@ public class EventManager implements AutoCloseable {
 
             EventTarget eventTarget = method.getAnnotation(EventTarget.class);
             int priority = annotationPriority(eventTarget, DEFAULT_PRIORITY);
+            final EventFilter<Event> eventFilter = filterFor(eventTarget.filter());
+            Predicate<Event> filter = eventFilter == null ? null : new Predicate<Event>() {
+                @Override
+                public boolean test(Event e) {
+                    return eventFilter.test(e);
+                }
+            };
             definitions.add(HandlerDefinition.forMethod(
                     method,
                     parameterType.asSubclass(Event.class),
                     priority,
-                    eventTarget.ignoreCancelled()
+                    eventTarget.ignoreCancelled(),
+                    filter
             ));
         }
 
@@ -1142,12 +1800,20 @@ public class EventManager implements AutoCloseable {
             EventTarget eventTarget = field.getAnnotation(EventTarget.class);
             boolean listenerPriority = eventTarget.value() == Priority.UNSPECIFIED;
             int priority = annotationPriority(eventTarget, DEFAULT_PRIORITY);
+            final EventFilter<Event> eventFilter = filterFor(eventTarget.filter());
+            Predicate<Event> filter = eventFilter == null ? null : new Predicate<Event>() {
+                @Override
+                public boolean test(Event e) {
+                    return eventFilter.test(e);
+                }
+            };
             definitions.add(HandlerDefinition.forField(
                     field,
                     fieldEventType,
                     priority,
                     listenerPriority,
-                    eventTarget.ignoreCancelled()
+                    eventTarget.ignoreCancelled(),
+                    filter
             ));
         }
 
@@ -1249,37 +1915,63 @@ public class EventManager implements AutoCloseable {
 
     private void bindListenerPlan(Object listener, ListenerPlan plan, Class<? extends Event> eventClass,
                                   boolean staticOnly) {
+        bindListenerPlan(listener, plan, eventClass, staticOnly, false);
+    }
+
+    private void bindListenerPlan(Object listener, ListenerPlan plan, Class<? extends Event> eventClass,
+                                  boolean staticOnly, boolean weak) {
         for (HandlerDefinition definition : plan.definitions) {
             if (eventClass != null && definition.eventType != eventClass) {
                 continue;
             }
-            bindDefinition(listener, definition, staticOnly);
+            bindDefinition(listener, definition, staticOnly, weak);
         }
     }
 
-    private void bindDefinition(Object listener, HandlerDefinition definition, boolean staticOnly) {
+    private void bindDefinition(final Object listener, final HandlerDefinition definition, boolean staticOnly) {
+        bindDefinition(listener, definition, staticOnly, false);
+    }
+
+    private void bindDefinition(final Object listener, final HandlerDefinition definition, boolean staticOnly, final boolean weak) {
         if (staticOnly && !definition.staticMember) {
             return;
         }
 
         if (definition.method != null) {
             Method method = definition.method;
+            Invoker invoker;
+            if (weak && !definition.staticMember) {
+                final WeakReference<Object> weakRef = new WeakReference<Object>(listener);
+                final InvokerFactory factory = invokerFactoryFor(method);
+                invoker = new Invoker() {
+                    @Override
+                    public void invoke(Event event) throws Throwable {
+                        Object target = weakRef.get();
+                        if (target != null) {
+                            factory.create(target).invoke(event);
+                        }
+                    }
+                };
+            } else {
+                invoker = invokerFor(method, listener);
+            }
             Handler handler = new Handler(
                     listener,
+                    weak,
                     method,
                     null,
                     definition.staticMember ? method.getDeclaringClass() : listener,
                     definition.eventType,
                     normalizePriority(definition.priority),
-                        definition.ignoreCancelled,
-                        registrationOrder.getAndIncrement(), false, null,
-                    invokerFor(method, listener)
+                    definition.ignoreCancelled,
+                    registrationOrder.getAndIncrement(), false, definition.filter,
+                    invoker
             );
             addHandler(handler);
             return;
         }
 
-        Field field = definition.field;
+        final Field field = definition.field;
         EventListener<?> fieldListener = listenerFromField(listener, field, true);
         if (fieldListener == null) {
             return;
@@ -1290,44 +1982,95 @@ public class EventManager implements AutoCloseable {
                 ? listenerPriority(fieldListener)
                 : definition.priority;
 
+        final Invoker invoker;
+        final WeakReference<Object> weakRef = (weak && !definition.staticMember) ? new WeakReference<Object>(listener) : null;
+        if (Modifier.isFinal(field.getModifiers())) {
+            @SuppressWarnings("unchecked")
+            final EventListener<Event> directListener = (EventListener<Event>) fieldListener;
+            if (weakRef != null) {
+                invoker = new Invoker() {
+                    @Override
+                    public void invoke(Event event) {
+                        if (weakRef.get() != null) {
+                            directListener.onEvent(dispatchType.cast(event));
+                        }
+                    }
+                };
+            } else {
+                invoker = new Invoker() {
+                    @Override
+                    public void invoke(Event event) {
+                        directListener.onEvent(dispatchType.cast(event));
+                    }
+                };
+            }
+        } else {
+            if (weakRef != null) {
+                invoker = new Invoker() {
+                    @Override
+                    public void invoke(Event event) {
+                        Object target = weakRef.get();
+                        if (target != null) {
+                            EventListener<?> current = listenerFromField(target, field, false);
+                            if (current != null) {
+                                @SuppressWarnings("unchecked")
+                                EventListener<Event> currentListener = (EventListener<Event>) current;
+                                currentListener.onEvent(dispatchType.cast(event));
+                            }
+                        }
+                    }
+                };
+            } else {
+                invoker = new Invoker() {
+                    @Override
+                    public void invoke(Event event) {
+                        EventListener<?> current = listenerFromField(listener, field, false);
+                        if (current != null) {
+                            @SuppressWarnings("unchecked")
+                            EventListener<Event> currentListener = (EventListener<Event>) current;
+                            currentListener.onEvent(dispatchType.cast(event));
+                        }
+                    }
+                };
+            }
+        }
+
         Handler handler = new Handler(
                 listener,
+                weak,
                 null,
                 field,
                 definition.staticMember ? field.getDeclaringClass() : listener,
                 dispatchType,
                 normalizePriority(priority),
                 definition.ignoreCancelled,
-                registrationOrder.getAndIncrement(), false, null,
-                new Invoker() {
-                    @SuppressWarnings({"unchecked", "rawtypes"})
-                    @Override
-                    public void invoke(Event event) {
-                        // Resolve mutable fields at dispatch time so replacing the
-                        // callback takes effect without a second registration.
-                        EventListener<?> current = listenerFromField(listener, field, false);
-                        if (current != null) {
-                            ((EventListener) current).onEvent(dispatchType.cast(event));
-                        }
-                    }
-                }
+                registrationOrder.getAndIncrement(), false, definition.filter,
+                invoker
         );
         addHandler(handler);
     }
 
     private void addHandler(final Handler handler) {
-        final boolean[] added = new boolean[1];
-        eventHandlers.compute(handler.eventType, new java.util.function.BiFunction<Class<? extends Event>, Handler[], Handler[]>() {
-            @Override
-            public Handler[] apply(Class<? extends Event> key, Handler[] existing) {
-                Handler[] updated = insertHandler(existing, handler);
-                if (updated != existing) {
-                    added[0] = true;
-                }
-                return updated;
+        boolean added = false;
+        while (true) {
+            Handler[] existing = eventHandlers.get(handler.eventType);
+            Handler[] updated = insertHandler(existing, handler);
+            if (updated == existing) {
+                return;
             }
-        });
-        if (added[0]) {
+            if (existing == null) {
+                if (eventHandlers.putIfAbsent(handler.eventType, updated) == null) {
+                    added = true;
+                    break;
+                }
+            } else {
+                if (eventHandlers.replace(handler.eventType, existing, updated)) {
+                    added = true;
+                    break;
+                }
+            }
+        }
+        if (added) {
             // Registration invalidates every flattened hierarchy cache. Clearing
             // eagerly prevents stale Class keys from accumulating when callers
             // create many short-lived event classes.
@@ -1342,7 +2085,7 @@ public class EventManager implements AutoCloseable {
             Handler[] handlers = eventHandlers.get(eventClass);
             if (handlers != null) {
                 for (Handler handler : handlers) {
-                    if (handler.listener == listener) {
+                    if (handler.matchesListener(listener)) {
                         matching.add(handler);
                     }
                 }
@@ -1350,7 +2093,7 @@ public class EventManager implements AutoCloseable {
         } else {
             for (Handler[] handlers : eventHandlers.values()) {
                 for (Handler handler : handlers) {
-                    if (handler.listener == listener) {
+                    if (handler.matchesListener(listener)) {
                         matching.add(handler);
                     }
                 }
@@ -1359,54 +2102,83 @@ public class EventManager implements AutoCloseable {
         return matching.toArray(new Handler[matching.size()]);
     }
 
-    private void removeHandlers(final Predicate<Handler> predicate) {
-        final boolean[] removed = new boolean[1];
-        for (Class<? extends Event> eventType : eventHandlers.keySet()) {
-            eventHandlers.computeIfPresent(eventType, new java.util.function.BiFunction<Class<? extends Event>, Handler[], Handler[]>() {
-                @Override
-                public Handler[] apply(Class<? extends Event> key, Handler[] handlers) {
-                    Handler[] updated = removeMatching(handlers, new Predicate<Handler>() {
-                        @Override
-                        public boolean test(Handler candidate) {
-                            boolean matches = predicate.test(candidate);
-                            if (matches) {
-                                candidate.active = false;
-                            }
-                            return matches;
-                        }
-                    });
-                    if (updated != handlers) {
-                        removed[0] = true;
-                    }
-                    return updated.length == 0 ? null : updated;
-                }
-            });
+    private void removeHandlers(Class<? extends Event> targetType, final Predicate<Handler> predicate) {
+        if (targetType == null) {
+            removeHandlers(predicate);
+            return;
         }
-        if (removed[0]) {
+        boolean removed = false;
+        while (true) {
+            Handler[] handlers = eventHandlers.get(targetType);
+            if (handlers == null) {
+                return;
+            }
+            Handler[] updated = removeMatching(handlers, predicate);
+            if (updated == handlers) {
+                return;
+            }
+            if (updated.length == 0) {
+                if (eventHandlers.remove(targetType, handlers)) {
+                    removed = true;
+                    markInactive(handlers, predicate);
+                    break;
+                }
+            } else {
+                if (eventHandlers.replace(targetType, handlers, updated)) {
+                    removed = true;
+                    markInactive(handlers, predicate);
+                    break;
+                }
+            }
+        }
+        if (removed) {
             dispatchCache.clear();
             mutationVersion.incrementAndGet();
         }
     }
 
-    private void collectHandlers(Class<?> type, Set<Handler> collected, Set<Class<?>> visitedTypes) {
-        if (type == null || type == Object.class || !Event.class.isAssignableFrom(type) || !visitedTypes.add(type)) {
-            return;
-        }
-
-        @SuppressWarnings("unchecked")
-        Class<? extends Event> eventType = (Class<? extends Event>) type;
-        Handler[] handlers = eventHandlers.get(eventType);
-        if (handlers != null) {
-            for (int i = 0; i < handlers.length; i++) {
-                collected.add(handlers[i]);
+    private void removeHandlers(final Predicate<Handler> predicate) {
+        boolean removed = false;
+        for (Class<? extends Event> eventType : eventHandlers.keySet()) {
+            while (true) {
+                Handler[] handlers = eventHandlers.get(eventType);
+                if (handlers == null) {
+                    break;
+                }
+                Handler[] updated = removeMatching(handlers, predicate);
+                if (updated == handlers) {
+                    break;
+                }
+                if (updated.length == 0) {
+                    if (eventHandlers.remove(eventType, handlers)) {
+                        removed = true;
+                        markInactive(handlers, predicate);
+                        break;
+                    }
+                } else {
+                    if (eventHandlers.replace(eventType, handlers, updated)) {
+                        removed = true;
+                        markInactive(handlers, predicate);
+                        break;
+                    }
+                }
             }
         }
-
-        for (Class<?> iface : type.getInterfaces()) {
-            collectHandlers(iface, collected, visitedTypes);
+        if (removed) {
+            dispatchCache.clear();
+            mutationVersion.incrementAndGet();
         }
-        collectHandlers(type.getSuperclass(), collected, visitedTypes);
     }
+
+    private static void markInactive(Handler[] handlers, Predicate<Handler> predicate) {
+        for (int i = 0; i < handlers.length; i++) {
+            if (predicate.test(handlers[i])) {
+                handlers[i].active = false;
+            }
+        }
+    }
+
+
 
     private static int listenerPriority(EventListener<?> listener) {
         try {
@@ -1455,8 +2227,8 @@ public class EventManager implements AutoCloseable {
         }
     }
 
-    private FieldAccessor fieldAccessor(final Field field) {
-        ConcurrentMap<Field, FieldAccessor> accessors = fieldAccessors.get(field.getDeclaringClass());
+    private static FieldAccessor fieldAccessor(final Field field) {
+        ConcurrentMap<Field, FieldAccessor> accessors = FIELD_ACCESSORS.get(field.getDeclaringClass());
         FieldAccessor accessor = accessors.get(field);
         if (accessor == null) {
             FieldAccessor created = buildFieldAccessor(field);
@@ -1484,8 +2256,7 @@ public class EventManager implements AutoCloseable {
                 final MethodHandle adapted = getter.asType(MethodType.methodType(Object.class));
                 return new FieldAccessor() {
                     @Override
-                    @SneakyThrows
-                    public Object get(Object owner) {
+                    public Object get(Object owner) throws Throwable {
                         return (Object) adapted.invokeExact();
                     }
                 };
@@ -1493,8 +2264,7 @@ public class EventManager implements AutoCloseable {
             final MethodHandle adapted = getter.asType(MethodType.methodType(Object.class, Object.class));
             return new FieldAccessor() {
                 @Override
-                @SneakyThrows
-                public Object get(Object owner) {
+                public Object get(Object owner) throws Throwable {
                     return (Object) adapted.invokeExact(owner);
                 }
             };
@@ -1694,15 +2464,19 @@ public class EventManager implements AutoCloseable {
         return updated;
     }
 
-    private Invoker invokerFor(Method method, Object listener) {
-        ConcurrentMap<Method, InvokerFactory> factories = invokerFactories.get(method.getDeclaringClass());
+    private static InvokerFactory invokerFactoryFor(Method method) {
+        ConcurrentMap<Method, InvokerFactory> factories = INVOKER_FACTORIES.get(method.getDeclaringClass());
         InvokerFactory factory = factories.get(method);
         if (factory == null) {
             InvokerFactory created = buildInvokerFactory(method);
             InvokerFactory previous = factories.putIfAbsent(method, created);
             factory = previous != null ? previous : created;
         }
-        return factory.create(listener);
+        return factory;
+    }
+
+    private Invoker invokerFor(Method method, Object listener) {
+        return invokerFactoryFor(method).create(listener);
     }
 
     private static InvokerFactory buildInvokerFactory(final Method method) {
@@ -1776,8 +2550,7 @@ public class EventManager implements AutoCloseable {
                 final MethodHandle adapted = handle.asType(MethodType.methodType(void.class, Event.class));
                 final Invoker invoker = new Invoker() {
                     @Override
-                    @SneakyThrows
-                    public void invoke(Event event) {
+                    public void invoke(Event event) throws Throwable {
                         adapted.invokeExact(event);
                     }
                 };
@@ -1795,8 +2568,7 @@ public class EventManager implements AutoCloseable {
                             .asType(MethodType.methodType(void.class, Event.class));
                     return new Invoker() {
                         @Override
-                        @SneakyThrows
-                        public void invoke(Event event) {
+                        public void invoke(Event event) throws Throwable {
                             bound.invokeExact(event);
                         }
                     };
@@ -1817,8 +2589,7 @@ public class EventManager implements AutoCloseable {
     private static Invoker reflectiveInvoker(final Method method, final Object listener, final boolean isStatic) {
         return new Invoker() {
             @Override
-            @SneakyThrows
-            public void invoke(Event event) {
+            public void invoke(Event event) throws Throwable {
                 try {
                     method.invoke(isStatic ? null : listener, event);
                 } catch (InvocationTargetException invocationFailure) {
@@ -1828,8 +2599,6 @@ public class EventManager implements AutoCloseable {
             }
         };
     }
-
-    @SneakyThrows
     private static Method resolvePrivateLookupIn() {
         try {
             return MethodHandles.class.getMethod("privateLookupIn", Class.class, MethodHandles.Lookup.class);
@@ -1838,11 +2607,28 @@ public class EventManager implements AutoCloseable {
         }
     }
 
-    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    private static java.lang.reflect.Constructor<MethodHandles.Lookup> resolveJava8LookupConstructor() {
+        try {
+            java.lang.reflect.Constructor<MethodHandles.Lookup> ctor =
+                    MethodHandles.Lookup.class.getDeclaredConstructor(Class.class, int.class);
+            ctor.setAccessible(true);
+            return ctor;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private static MethodHandles.Lookup lookupFor(Class<?> declaringClass) {
         if (PRIVATE_LOOKUP_IN != null) {
             try {
                 return (MethodHandles.Lookup) PRIVATE_LOOKUP_IN.invoke(null, declaringClass, LOOKUP);
+            } catch (Throwable ignored) {
+            }
+        }
+        if (JAVA8_LOOKUP_CTOR != null) {
+            try {
+                return JAVA8_LOOKUP_CTOR.newInstance(declaringClass, -1);
             } catch (Throwable ignored) {
             }
         }
@@ -1861,17 +2647,21 @@ public class EventManager implements AutoCloseable {
         Object get(Object owner) throws Throwable;
     }
 
-    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private final class HandlerSubscription implements Subscription {
         private final Handler handler;
         private final AtomicBoolean subscribed = new AtomicBoolean(true);
+
+        private HandlerSubscription(Handler handler) {
+            this.handler = handler;
+        }
 
         @Override
         public void unsubscribe() {
             if (!subscribed.compareAndSet(true, false)) {
                 return;
             }
-            removeHandlers(new Predicate<Handler>() {
+            handler.active = false;
+            removeHandlers(handler.eventType, new Predicate<Handler>() {
                 @Override
                 public boolean test(Handler candidate) {
                     return candidate == handler;
@@ -1881,7 +2671,11 @@ public class EventManager implements AutoCloseable {
 
         @Override
         public boolean isSubscribed() {
-            if (!subscribed.get()) {
+            if (!subscribed.get() || !handler.active) {
+                return false;
+            }
+            if (handler.weakListener != null && handler.weakListener.get() == null) {
+                handler.active = false;
                 return false;
             }
             Handler[] handlers = eventHandlers.get(handler.eventType);
@@ -1897,10 +2691,13 @@ public class EventManager implements AutoCloseable {
         }
     }
 
-    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private final class ListenerSubscription implements Subscription {
         private final Handler[] handlers;
         private final AtomicBoolean subscribed = new AtomicBoolean(true);
+
+        private ListenerSubscription(Handler[] handlers) {
+            this.handlers = handlers;
+        }
 
         @Override
         public void unsubscribe() {
@@ -1924,6 +2721,13 @@ public class EventManager implements AutoCloseable {
                 return false;
             }
             for (Handler handler : handlers) {
+                if (!handler.active) {
+                    continue;
+                }
+                if (handler.weakListener != null && handler.weakListener.get() == null) {
+                    handler.active = false;
+                    continue;
+                }
                 Handler[] current = eventHandlers.get(handler.eventType);
                 if (current != null) {
                     for (Handler candidate : current) {
@@ -1937,25 +2741,39 @@ public class EventManager implements AutoCloseable {
         }
     }
 
-    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
-    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
     private static final class ListenerPlan {
-        HandlerDefinition[] definitions;
+        private final HandlerDefinition[] definitions;
+
+        private ListenerPlan(HandlerDefinition[] definitions) {
+            this.definitions = definitions;
+        }
     }
 
-    @AllArgsConstructor(access = AccessLevel.PRIVATE)
-    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
     private static final class HandlerDefinition {
-        Method method;
-        Field field;
-        Class<? extends Event> eventType;
-        int priority;
-        boolean listenerPriority;
-        boolean ignoreCancelled;
-        boolean staticMember;
+        private final Method method;
+        private final Field field;
+        private final Class<? extends Event> eventType;
+        private final int priority;
+        private final boolean listenerPriority;
+        private final boolean ignoreCancelled;
+        private final boolean staticMember;
+        private final Predicate<Event> filter;
+
+        private HandlerDefinition(Method method, Field field, Class<? extends Event> eventType,
+                                  int priority, boolean listenerPriority, boolean ignoreCancelled,
+                                  boolean staticMember, Predicate<Event> filter) {
+            this.method = method;
+            this.field = field;
+            this.eventType = eventType;
+            this.priority = priority;
+            this.listenerPriority = listenerPriority;
+            this.ignoreCancelled = ignoreCancelled;
+            this.staticMember = staticMember;
+            this.filter = filter;
+        }
 
         private static HandlerDefinition forMethod(Method method, Class<? extends Event> eventType,
-                                                   int priority, boolean ignoreCancelled) {
+                                                   int priority, boolean ignoreCancelled, Predicate<Event> filter) {
             return new HandlerDefinition(
                     method,
                     null,
@@ -1963,13 +2781,14 @@ public class EventManager implements AutoCloseable {
                     priority,
                     false,
                     ignoreCancelled,
-                    Modifier.isStatic(method.getModifiers())
+                    Modifier.isStatic(method.getModifiers()),
+                    filter
             );
         }
 
         private static HandlerDefinition forField(Field field, Class<? extends Event> eventType,
                                                   int priority, boolean listenerPriority,
-                                                  boolean ignoreCancelled) {
+                                                  boolean ignoreCancelled, Predicate<Event> filter) {
             return new HandlerDefinition(
                     null,
                     field,
@@ -1977,20 +2796,25 @@ public class EventManager implements AutoCloseable {
                     priority,
                     listenerPriority,
                     ignoreCancelled,
-                    Modifier.isStatic(field.getModifiers())
+                    Modifier.isStatic(field.getModifiers()),
+                    filter
             );
         }
     }
 
-    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
-    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
     private static final class CachedDispatch {
-        long version;
-        Handler[] handlers;
+        private final long version;
+        private final Handler[] handlers;
+
+        private CachedDispatch(long version, Handler[] handlers) {
+            this.version = version;
+            this.handlers = handlers;
+        }
     }
 
     private static final class Handler {
         private final Object listener;
+        private final WeakReference<Object> weakListener;
         private final Method method;
         private final Field field;
         private final Object dedupeOwner;
@@ -2001,12 +2825,19 @@ public class EventManager implements AutoCloseable {
         private final boolean once;
         private final Predicate<Event> filter;
         private final Invoker invoker;
+        private final EventSubscriber subscriber;
         private volatile boolean active = true;
 
-        private Handler(Object listener, Method method, Field field, Object dedupeOwner,
+        private Handler(Object listener, boolean weak, Method method, Field field, Object dedupeOwner,
                         Class<? extends Event> eventType, int priority, boolean ignoreCancelled,
                         long order, boolean once, Predicate<Event> filter, Invoker invoker) {
-            this.listener = listener;
+            if (weak && listener != null && !(listener instanceof Class<?>)) {
+                this.listener = null;
+                this.weakListener = new WeakReference<Object>(listener);
+            } else {
+                this.listener = listener;
+                this.weakListener = null;
+            }
             this.method = method;
             this.field = field;
             this.dedupeOwner = dedupeOwner;
@@ -2017,14 +2848,54 @@ public class EventManager implements AutoCloseable {
             this.once = once;
             this.filter = filter;
             this.invoker = invoker;
+            this.subscriber = (listener instanceof EventSubscriber && !weak) ? (EventSubscriber) listener : null;
+        }
+
+        private Handler(Object listener, Method method, Field field, Object dedupeOwner,
+                        Class<? extends Event> eventType, int priority, boolean ignoreCancelled,
+                        long order, boolean once, Predicate<Event> filter, Invoker invoker) {
+            this(listener, false, method, field, dedupeOwner, eventType, priority, ignoreCancelled, order, once, filter, invoker);
+        }
+
+        private boolean isWeak() {
+            return weakListener != null;
+        }
+
+        private boolean isDead() {
+            return weakListener != null && weakListener.get() == null;
+        }
+
+        private Object getListener() {
+            return weakListener != null ? weakListener.get() : listener;
+        }
+
+        private boolean matchesListener(Object candidate) {
+            if (candidate == null) return false;
+            if (listener == candidate) return true;
+            if (weakListener != null) {
+                Object target = weakListener.get();
+                return target == candidate;
+            }
+            return false;
         }
 
         private void invoke(Event event) throws Throwable {
             invoker.invoke(event);
         }
 
-        private boolean isHandlingEvents() {
-            return !(listener instanceof EventSubscriber) || ((EventSubscriber) listener).isHandlingEvents();
+        private boolean isHandlingEvents(Event event) {
+            if (weakListener != null) {
+                Object target = weakListener.get();
+                if (target == null) {
+                    active = false;
+                    return false;
+                }
+                if (target instanceof EventSubscriber) {
+                    return ((EventSubscriber) target).isHandlingEvents(event);
+                }
+                return true;
+            }
+            return subscriber == null || subscriber.isHandlingEvents(event);
         }
 
         @Override
@@ -2062,25 +2933,141 @@ public class EventManager implements AutoCloseable {
     }
 
     private static final class MetricCounter {
-        private final AtomicLong dispatchedEvents = new AtomicLong();
-        private final AtomicLong handlerInvocations = new AtomicLong();
-        private final AtomicLong failures = new AtomicLong();
+        private final LongAdder dispatchedEvents = new LongAdder();
+        private final LongAdder handlerInvocations = new LongAdder();
+        private final LongAdder failures = new LongAdder();
+        private final LongAdder totalDurationNanos = new LongAdder();
+        private final AtomicLong maxDurationNanos = new AtomicLong();
+
+        private void recordDuration(long nanos) {
+            totalDurationNanos.add(nanos);
+            long currentMax;
+            while (nanos > (currentMax = maxDurationNanos.get())) {
+                if (maxDurationNanos.compareAndSet(currentMax, nanos)) {
+                    break;
+                }
+            }
+        }
 
         private EventMetrics snapshot(Class<?> eventType) {
-            return new EventMetrics(eventType, dispatchedEvents.get(),
-                    handlerInvocations.get(), failures.get());
+            return new EventMetrics(eventType, dispatchedEvents.sum(),
+                    handlerInvocations.sum(), failures.sum(),
+                    totalDurationNanos.sum(), maxDurationNanos.get());
         }
     }
 
-    @EqualsAndHashCode
-    @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
     private static final class MethodSignature {
-        String name;
-        Class<?>[] parameterTypes;
+        private final String name;
+        private final Class<?>[] parameterTypes;
 
         private MethodSignature(Method method) {
             this.name = method.getName();
             this.parameterTypes = method.getParameterTypes();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof MethodSignature)) return false;
+            MethodSignature that = (MethodSignature) o;
+            return Objects.equals(name, that.name) && Arrays.equals(parameterTypes, that.parameterTypes);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * Objects.hashCode(name) + Arrays.hashCode(parameterTypes);
+        }
+    }
+
+    /**
+     * Fluent builder for creating configured {@link EventManager} instances.
+     */
+    @Override
+    public String toString() {
+        return "EventManager[name=\"" + name + "\""
+                + ", registeredTypes=" + eventHandlers.size()
+                + ", handlers=" + handlerCount()
+                + ", metrics=" + metricsEnabled
+                + ", closed=" + closed
+                + (parent != null ? ", parent=\"" + parent.getName() + "\"" : "")
+                + ']';
+    }
+
+    public static final class Builder {
+        private String name = "EventManager";
+        private Executor defaultExecutor;
+        private ErrorPolicy errorPolicy = ErrorPolicy.CONTINUE;
+        private EventErrorHandler errorHandler = DEFAULT_ERROR_HANDLER;
+        private boolean metricsEnabled = true;
+        private boolean deadEventsEnabled = true;
+        private final List<EventInterceptor> interceptors = new ArrayList<EventInterceptor>();
+        private Predicate<Thread> threadEnforcer;
+
+        public Builder name(String name) {
+            this.name = name;
+            return this;
+        }
+
+        public Builder defaultExecutor(Executor defaultExecutor) {
+            this.defaultExecutor = defaultExecutor;
+            return this;
+        }
+
+        public Builder errorPolicy(ErrorPolicy errorPolicy) {
+            this.errorPolicy = errorPolicy != null ? errorPolicy : ErrorPolicy.CONTINUE;
+            return this;
+        }
+
+        public Builder errorHandler(EventErrorHandler errorHandler) {
+            this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
+            return this;
+        }
+
+        public Builder metricsEnabled(boolean metricsEnabled) {
+            this.metricsEnabled = metricsEnabled;
+            return this;
+        }
+
+        public Builder deadEventsEnabled(boolean deadEventsEnabled) {
+            this.deadEventsEnabled = deadEventsEnabled;
+            return this;
+        }
+
+        public Builder interceptor(EventInterceptor interceptor) {
+            if (interceptor != null) {
+                this.interceptors.add(interceptor);
+            }
+            return this;
+        }
+
+        public Builder enforceThread(final Thread thread) {
+            if (thread == null) {
+                this.threadEnforcer = null;
+            } else {
+                this.threadEnforcer = new Predicate<Thread>() {
+                    @Override
+                    public boolean test(Thread candidate) {
+                        return candidate == thread;
+                    }
+                };
+            }
+            return this;
+        }
+
+        public Builder enforceThread(Predicate<Thread> threadEnforcer) {
+            this.threadEnforcer = threadEnforcer;
+            return this;
+        }
+
+        public EventManager build() {
+            EventManager bus = new EventManager(this.name, null, this.errorHandler, this.errorPolicy, this.defaultExecutor);
+            bus.setMetricsEnabled(this.metricsEnabled);
+            bus.setDeadEventsEnabled(this.deadEventsEnabled);
+            if (!this.interceptors.isEmpty()) {
+                bus.setInterceptor(EventInterceptors.chain(this.interceptors));
+            }
+            bus.enforceThread(this.threadEnforcer);
+            return bus;
         }
     }
 }

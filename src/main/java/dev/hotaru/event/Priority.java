@@ -1,10 +1,8 @@
 package dev.hotaru.event;
 
-import lombok.AccessLevel;
-import lombok.NoArgsConstructor;
-
-@NoArgsConstructor(access = AccessLevel.PRIVATE)
 public final class Priority {
+    private Priority() {}
+
     public static final int UNSPECIFIED = Integer.MIN_VALUE;
     public static final int FIRST = Integer.MIN_VALUE + 1;
     public static final int HIGHEST = 0;

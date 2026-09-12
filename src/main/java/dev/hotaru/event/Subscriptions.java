@@ -1,15 +1,13 @@
 package dev.hotaru.event;
 
-import lombok.RequiredArgsConstructor;
-import lombok.experimental.UtilityClass;
-
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-@UtilityClass
-public class Subscriptions {
-    public Subscription combine(Subscription... subscriptions) {
+public final class Subscriptions {
+    private Subscriptions() {}
+
+    public static Subscription combine(Subscription... subscriptions) {
         if (subscriptions == null || subscriptions.length == 0) {
             return Subscription.NOOP;
         }
@@ -29,7 +27,7 @@ public class Subscriptions {
         return new CompositeSubscription(active.toArray(new Subscription[active.size()]));
     }
 
-    private boolean containsIdentity(List<Subscription> subscriptions, Subscription candidate) {
+    private static boolean containsIdentity(List<Subscription> subscriptions, Subscription candidate) {
         for (Subscription subscription : subscriptions) {
             if (subscription == candidate) {
                 return true;
@@ -38,10 +36,13 @@ public class Subscriptions {
         return false;
     }
 
-    @RequiredArgsConstructor
     private static final class CompositeSubscription implements Subscription {
         private final Subscription[] subscriptions;
         private final AtomicBoolean subscribed = new AtomicBoolean(true);
+
+        private CompositeSubscription(Subscription[] subscriptions) {
+            this.subscriptions = subscriptions;
+        }
 
         @Override
         public void unsubscribe() {

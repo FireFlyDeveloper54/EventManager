@@ -1,6 +1,6 @@
 package dev.hotaru.event;
 
-public interface Subscription {
+public interface Subscription extends AutoCloseable {
 
     Subscription NOOP = new Subscription() {
         @Override
@@ -14,6 +14,11 @@ public interface Subscription {
     };
 
     void unsubscribe();
+
+    @Override
+    default void close() {
+        unsubscribe();
+    }
 
     default boolean isSubscribed() {
         return true;
