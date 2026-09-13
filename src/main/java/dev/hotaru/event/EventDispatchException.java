@@ -17,6 +17,16 @@ public final class EventDispatchException extends RuntimeException {
         this.listener = listener;
     }
 
+    public EventDispatchException(String message, Event event, Throwable cause) {
+        this(message, event, null, cause);
+    }
+
+    public EventDispatchException(String message, Event event, Object listener, Throwable cause) {
+        super(message, cause);
+        this.event = event;
+        this.listener = listener;
+    }
+
     public Event getEvent() {
         return event;
     }

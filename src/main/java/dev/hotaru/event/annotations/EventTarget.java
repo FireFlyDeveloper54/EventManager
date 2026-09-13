@@ -17,4 +17,31 @@ public @interface EventTarget {
     boolean ignoreCancelled() default false;
 
     Class<? extends EventFilter> filter() default EventFilter.PassAll.class;
+
+    boolean sticky() default false;
+
+    /**
+     * Unique identifier for this handler in topological DAG ordering.
+     */
+    String id() default "";
+
+    /**
+     * Handler IDs that must execute before this handler.
+     */
+    String[] after() default {};
+
+    /**
+     * Handler IDs that must execute after this handler.
+     */
+    String[] before() default {};
+
+    /**
+     * Listener classes that must execute before this handler.
+     */
+    Class<?>[] afterClasses() default {};
+
+    /**
+     * Listener classes that must execute after this handler.
+     */
+    Class<?>[] beforeClasses() default {};
 }

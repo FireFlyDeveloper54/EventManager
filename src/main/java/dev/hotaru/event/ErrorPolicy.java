@@ -8,6 +8,8 @@ public enum ErrorPolicy {
     CONTINUE,
     /** Report the failure and stop the current event dispatch. */
     STOP,
-    /** Report the failure and throw it back to the caller. */
-    PROPAGATE
+    /** Report the failure and throw it back to the caller immediately. */
+    PROPAGATE,
+    /** Execute all handlers, report failures, and throw an aggregated exception with suppressed causes. */
+    AGGREGATE
 }

@@ -16,14 +16,25 @@ public final class DeadEvent implements Event {
     private final Event event;
     private final long timestamp;
 
+    private final EventTrace trace;
+
     public DeadEvent(Object source, Event event) {
-        this(source, event, System.currentTimeMillis());
+        this(source, event, System.currentTimeMillis(), null);
+    }
+
+    public DeadEvent(Object source, Event event, EventTrace trace) {
+        this(source, event, System.currentTimeMillis(), trace);
     }
 
     public DeadEvent(Object source, Event event, long timestamp) {
+        this(source, event, timestamp, null);
+    }
+
+    public DeadEvent(Object source, Event event, long timestamp, EventTrace trace) {
         this.source = Objects.requireNonNull(source, "source");
         this.event = Objects.requireNonNull(event, "event");
         this.timestamp = timestamp;
+        this.trace = trace;
     }
 
     public Object getSource() {
@@ -36,6 +47,10 @@ public final class DeadEvent implements Event {
 
     public long getTimestamp() {
         return timestamp;
+    }
+
+    public EventTrace getTrace() {
+        return trace;
     }
 
     @Override

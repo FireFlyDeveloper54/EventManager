@@ -1,5 +1,6 @@
 package dev.hotaru.event;
 
+@FunctionalInterface
 public interface Subscription extends AutoCloseable {
 
     Subscription NOOP = new Subscription() {

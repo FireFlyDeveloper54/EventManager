@@ -29,12 +29,30 @@ tasks.withType(JavaCompile).configureEach {
     options.compilerArgs.addAll(['-Xlint:unchecked', '-Xlint:deprecation'])
 }
 
+javadoc {
+    options.encoding = 'UTF-8'
+    options.charSet = 'UTF-8'
+    if (JavaVersion.current().isJava8Compatible()) {
+        options.addStringOption('Xdoclint:none', '-quiet')
+    }
+}
+
 def testJavaVersion = providers.gradleProperty('testJavaVersion').orElse('8')
 
 test {
     useJUnitPlatform()
     javaLauncher = javaToolchains.launcherFor {
         languageVersion = JavaLanguageVersion.of(testJavaVersion.get().toInteger())
+    }
+}
+
+jar {
+    manifest {
+        attributes(
+            'Automatic-Module-Name': 'dev.hotaru.event',
+            'Implementation-Title': 'EventManager',
+            'Implementation-Version': project.version
+        )
     }
 }
 
