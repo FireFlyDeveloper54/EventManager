@@ -105,6 +105,8 @@ public class EventManager implements AutoCloseable {
             new ConcurrentHashMap<Class<? extends Event>, Handler[]>();
     private final ConcurrentMap<Class<?>, CachedDispatch> dispatchCache =
             new ConcurrentHashMap<Class<?>, CachedDispatch>();
+    private final ConcurrentMap<Class<?>, Long> typeMutationStamps =
+            new ConcurrentHashMap<Class<?>, Long>();
     private static final ClassValue<ConcurrentMap<Method, InvokerFactory>> INVOKER_FACTORIES =
             new ClassValue<ConcurrentMap<Method, InvokerFactory>>() {
                 @Override
@@ -325,7 +327,7 @@ public class EventManager implements AutoCloseable {
         return interceptor;
     }
 
-    public synchronized void setInterceptor(EventInterceptor interceptor) {
+    public void setInterceptor(EventInterceptor interceptor) {
         this.interceptorList.clear();
         if (interceptor != null) {
             this.interceptorList.add(interceptor);
@@ -336,7 +338,7 @@ public class EventManager implements AutoCloseable {
     /**
      * Appends an interceptor to the current interceptor chain.
      */
-    public synchronized void addInterceptor(EventInterceptor interceptor) {
+    public void addInterceptor(EventInterceptor interceptor) {
         if (interceptor == null) {
             return;
         }
@@ -350,7 +352,7 @@ public class EventManager implements AutoCloseable {
      * @param interceptor the interceptor to remove
      * @return true if removed, false otherwise
      */
-    public synchronized boolean removeInterceptor(EventInterceptor interceptor) {
+    public boolean removeInterceptor(EventInterceptor interceptor) {
         if (interceptor == null) {
             return false;
         }
@@ -841,26 +843,24 @@ public class EventManager implements AutoCloseable {
         if (listener instanceof Class<?>) {
             return subscribe((Class<?>) listener);
         }
-        synchronized (this) {
-            if (isRegistered(listener)) {
-                return Subscription.NOOP;
-            }
-            register(listener);
-            return ownedSubscription(handlersForListener(listener, null));
+        // No lock needed: insertHandler() deduplicates equal handlers, so a
+        // racing double subscribe cannot register the listener twice.
+        if (isRegistered(listener)) {
+            return Subscription.NOOP;
         }
+        register(listener);
+        return ownedSubscription(handlersForListener(listener, null));
     }
 
     public Subscription subscribe(Class<?> listenerClass) {
         if (listenerClass == null) {
             return Subscription.NOOP;
         }
-        synchronized (this) {
-            if (isRegistered(listenerClass)) {
-                return Subscription.NOOP;
-            }
-            register(listenerClass);
-            return ownedSubscription(handlersForListener(listenerClass, null));
+        if (isRegistered(listenerClass)) {
+            return Subscription.NOOP;
         }
+        register(listenerClass);
+        return ownedSubscription(handlersForListener(listenerClass, null));
     }
 
     public Subscription subscribe(Object listener, Class<? extends Event> eventClass) {
@@ -874,17 +874,15 @@ public class EventManager implements AutoCloseable {
             Class<Event> evt = (Class<Event>) eventClass;
             return register(evt, consumer);
         }
-        synchronized (this) {
-            if (isRegistered(listener, eventClass)) {
-                return Subscription.NOOP;
-            }
-            if (listener instanceof Class<?>) {
-                register((Class<?>) listener, eventClass);
-            } else {
-                register(listener, eventClass);
-            }
-            return ownedSubscription(handlersForListener(listener, eventClass));
+        if (isRegistered(listener, eventClass)) {
+            return Subscription.NOOP;
         }
+        if (listener instanceof Class<?>) {
+            register((Class<?>) listener, eventClass);
+        } else {
+            register(listener, eventClass);
+        }
+        return ownedSubscription(handlersForListener(listener, eventClass));
     }
 
     /**
@@ -897,13 +895,11 @@ public class EventManager implements AutoCloseable {
         if (listener instanceof Class<?>) {
             return subscribe((Class<?>) listener);
         }
-        synchronized (this) {
-            if (isRegistered(listener)) {
-                return Subscription.NOOP;
-            }
-            registerWeak(listener);
-            return ownedSubscription(handlersForListener(listener, null));
+        if (isRegistered(listener)) {
+            return Subscription.NOOP;
         }
+        registerWeak(listener);
+        return ownedSubscription(handlersForListener(listener, null));
     }
 
     /**
@@ -920,17 +916,15 @@ public class EventManager implements AutoCloseable {
             Class<Event> evt = (Class<Event>) eventClass;
             return registerWeak(evt, consumer);
         }
-        synchronized (this) {
-            if (isRegistered(listener, eventClass)) {
-                return Subscription.NOOP;
-            }
-            if (listener instanceof Class<?>) {
-                register((Class<?>) listener, eventClass);
-            } else {
-                registerWeak(listener, eventClass);
-            }
-            return ownedSubscription(handlersForListener(listener, eventClass));
+        if (isRegistered(listener, eventClass)) {
+            return Subscription.NOOP;
         }
+        if (listener instanceof Class<?>) {
+            register((Class<?>) listener, eventClass);
+        } else {
+            registerWeak(listener, eventClass);
+        }
+        return ownedSubscription(handlersForListener(listener, eventClass));
     }
 
     private Subscription ownedSubscription(Handler[] handlers) {
@@ -1149,8 +1143,7 @@ public class EventManager implements AutoCloseable {
             for (Handler handler : removed) {
                 handler.active = false;
             }
-            dispatchCache.clear();
-            mutationVersion.incrementAndGet();
+            invalidateDispatchCache(eventType);
         }
     }
 
@@ -1828,15 +1821,48 @@ public class EventManager implements AutoCloseable {
     }
 
     private Handler[] handlersFor(Class<?> eventClass) {
-        long version = mutationVersion.get();
         CachedDispatch cached = dispatchCache.get(eventClass);
-        if (cached != null && cached.version == version) {
+        if (cached != null) {
             return cached.handlers;
         }
 
+        long startVersion = mutationVersion.get();
         Handler[] built = buildDispatchList(eventClass);
-        dispatchCache.put(eventClass, new CachedDispatch(version, built));
+        CachedDispatch entry = new CachedDispatch(built);
+        dispatchCache.put(eventClass, entry);
+        // Validate-after-publish: a registration racing this build could
+        // otherwise leave a stale list cached indefinitely.
+        Class<? extends Event>[] hierarchy = EVENT_HIERARCHIES.get(eventClass);
+        for (int i = 0; i < hierarchy.length; i++) {
+            Long stamp = typeMutationStamps.get(hierarchy[i]);
+            if (stamp != null && stamp > startVersion) {
+                dispatchCache.remove(eventClass, entry);
+                break;
+            }
+        }
         return built;
+    }
+
+    /**
+     * Marks the handlers of {@code mutatedType} as changed and drops only the
+     * cache entries whose dispatch list can be affected by that type, leaving
+     * unrelated event types cached.
+     */
+    private void invalidateDispatchCache(Class<? extends Event> mutatedType) {
+        typeMutationStamps.put(mutatedType, mutationVersion.incrementAndGet());
+        for (Class<?> cachedType : dispatchCache.keySet()) {
+            if (cachedType == mutatedType) {
+                dispatchCache.remove(cachedType);
+                continue;
+            }
+            Class<? extends Event>[] hierarchy = EVENT_HIERARCHIES.get(cachedType);
+            for (int i = 0; i < hierarchy.length; i++) {
+                if (hierarchy[i] == mutatedType) {
+                    dispatchCache.remove(cachedType);
+                    break;
+                }
+            }
+        }
     }
 
     private Handler[] exactHandlersFor(Class<?> eventClass) {
@@ -2305,11 +2331,7 @@ public class EventManager implements AutoCloseable {
             }
         }
         if (added) {
-            // Registration invalidates every flattened hierarchy cache. Clearing
-            // eagerly prevents stale Class keys from accumulating when callers
-            // create many short-lived event classes.
-            dispatchCache.clear();
-            mutationVersion.incrementAndGet();
+            invalidateDispatchCache(handler.eventType);
         }
     }
 
@@ -2366,13 +2388,12 @@ public class EventManager implements AutoCloseable {
             }
         }
         if (removed) {
-            dispatchCache.clear();
-            mutationVersion.incrementAndGet();
+            invalidateDispatchCache(targetType);
         }
     }
 
     private void removeHandlers(final Predicate<Handler> predicate) {
-        boolean removed = false;
+        List<Class<? extends Event>> mutated = null;
         for (Class<? extends Event> eventType : eventHandlers.keySet()) {
             while (true) {
                 Handler[] handlers = eventHandlers.get(eventType);
@@ -2383,24 +2404,26 @@ public class EventManager implements AutoCloseable {
                 if (updated == handlers) {
                     break;
                 }
+                boolean replaced;
                 if (updated.length == 0) {
-                    if (eventHandlers.remove(eventType, handlers)) {
-                        removed = true;
-                        markInactive(handlers, predicate);
-                        break;
-                    }
+                    replaced = eventHandlers.remove(eventType, handlers);
                 } else {
-                    if (eventHandlers.replace(eventType, handlers, updated)) {
-                        removed = true;
-                        markInactive(handlers, predicate);
-                        break;
+                    replaced = eventHandlers.replace(eventType, handlers, updated);
+                }
+                if (replaced) {
+                    markInactive(handlers, predicate);
+                    if (mutated == null) {
+                        mutated = new ArrayList<Class<? extends Event>>();
                     }
+                    mutated.add(eventType);
+                    break;
                 }
             }
         }
-        if (removed) {
-            dispatchCache.clear();
-            mutationVersion.incrementAndGet();
+        if (mutated != null) {
+            for (int i = 0; i < mutated.size(); i++) {
+                invalidateDispatchCache(mutated.get(i));
+            }
         }
     }
 
@@ -3329,11 +3352,9 @@ public class EventManager implements AutoCloseable {
     }
 
     private static final class CachedDispatch {
-        private final long version;
         private final Handler[] handlers;
 
-        private CachedDispatch(long version, Handler[] handlers) {
-            this.version = version;
+        private CachedDispatch(Handler[] handlers) {
             this.handlers = handlers;
         }
     }
@@ -3634,7 +3655,9 @@ public class EventManager implements AutoCloseable {
                     for (Runnable commitHook : tx.commitHooks) {
                         try {
                             commitHook.run();
-                        } catch (Throwable ignored) {}
+                        } catch (Throwable t) {
+                            log.log(Level.WARNING, "Transaction commit hook failed", t);
+                        }
                     }
                 } else {
                     tx.buffer.clear();
@@ -3642,7 +3665,9 @@ public class EventManager implements AutoCloseable {
                     for (int i = tx.compensations.size() - 1; i >= 0; i--) {
                         try {
                             tx.compensations.get(i).run();
-                        } catch (Throwable ignored) {}
+                        } catch (Throwable t) {
+                            log.log(Level.SEVERE, "Saga compensation action failed; remaining compensations still run", t);
+                        }
                     }
                 }
             }
@@ -3655,7 +3680,9 @@ public class EventManager implements AutoCloseable {
                 for (int i = tx.compensations.size() - 1; i >= 0; i--) {
                     try {
                         tx.compensations.get(i).run();
-                    } catch (Throwable ignored) {}
+                    } catch (Throwable error) {
+                        log.log(Level.SEVERE, "Saga compensation action failed; remaining compensations still run", error);
+                    }
                 }
             }
             if (t instanceof RuntimeException) {

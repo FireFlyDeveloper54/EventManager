@@ -1,10 +1,10 @@
 # EventManager
 
-一个无任何第三方依赖（100% 纯 JDK 原生标准库实现，零编译期/运行时外部依赖）、基于注解与 Lambda 的高性能通用 Java 事件总线，全面兼容 JDK 8 至 JDK 25。
+一个无任何第三方依赖（100% 纯 JDK 原生标准库实现，零编译期/运行时外部依赖）、基于注解与 Lambda 的高性能通用 Java 事件总线，全面兼容 JDK 8 至 JDK 25（兼容性由 CI 在 JDK 8/11/17/21/25 矩阵上自动验证，性能数据见文末「基准测试」）。
 
 ## 核心特性
 
-- **极致性能**：基于 `ClassValue` 与 `LambdaMetafactory` 实现进程级动态编译与元数据复用；分发使用不可变快照，单类型事件零集合分配。
+- **极致性能**：基于 `ClassValue` 与 `LambdaMetafactory` 实现进程级动态编译与元数据复用；分发使用不可变快照，稳态单类型事件派发零集合分配。注册/注销采用**按事件类型的精准缓存失效**——注册风暴场景下不再全量清空分发缓存（见文末基准测试）。
 - **Project Loom 虚拟线程**：原生集成 JDK 21+ 虚拟线程（Virtual Threads）异步调度，支持单机百万级高并发事件处理；在 JDK 8-20 上自动优雅降级为平台线程池。
 - **泛型事件精准派发**：原生支持 `GenericEvent<T>` 与 `TypeToken<T>`，彻底攻克 Java 运行时泛型擦除难题。支持泛型参数多态继承与通配符匹配（如 `OrderEvent<FoodOrder>` 与 `OrderEvent<BookOrder>` 互不干扰）。
 - **粘性事件与即时回放 (Sticky Events)**：支持 `bus.dispatchSticky(event)` 缓存事件状态，并在新监听器（`@EventTarget(sticky = true)` 或 `.sticky()`）注册时立即精准重播最近一次的粘性事件，适用于配置变更、状态同步与跨生命周期订阅。
@@ -27,7 +27,7 @@
 - **响应式流发布者**：提供 `bus.asPublisher(Event.class)`，以纯原生函数式支持响应式流订阅与链式过滤。
 - **聚合异常传播策略**：新增 `ErrorPolicy.AGGREGATE`，分发时不阻断后续处理器，分发结束后利用原生 `Throwable.addSuppressed(...)` 将所有失败聚合为结构化 `EventDispatchException` 抛给调用方。
 - **事务性事件缓冲与回滚**：原生提供线程隔离的事件事务（`bus.transaction(...)`），代码块正常结束原子批量 flush；若中途报错或显式回滚，所有缓冲事件自动丢弃（Rollback），杜绝业务脏状态副作用扩散。
-- **无锁并发**：处理器增删全流程采用 CAS 无锁循环，杜绝全局粗粒度锁竞争与 `ConcurrentModificationException`。
+- **无锁并发**：处理器增删采用 CAS 无锁写时复制（COW）循环，杜绝 `ConcurrentModificationException`；分发快照读取全程无锁，监听器查重基于 Handler 等值去重而非全局互斥锁。
 - **内存安全**：原生支持弱引用托管（`registerWeak` / `subscribeWeak` / `.weak()`），提供主动死引用清理（`purgeDeadHandlers`），彻底消除长生命周期事件总线导致的 *Lapsed Listener* 内存残留。
 - **死信检测**：原生支持 `DeadEvent` 未处理事件感知，防止复杂系统与插件架构中事件因时序颠倒而静默丢失。
 - **声明式过滤**：支持 `@EventTarget(filter = MyFilter.class)`，以声明方式将事件过滤器绑定至监听器；支持逻辑运算与 JDK `Predicate` 无缝互通。
@@ -415,3 +415,35 @@ System.out.println("录制到的事件总数: " + session.size());
 EventManager mockBus = new EventManager();
 session.replayTo(mockBus); // 完全无损重现当时的事件链路与上下文！
 ```
+
+## 构建 / 测试 / 基准测试
+
+```bash
+# 编译 + 全量测试（默认使用 JDK 8 工具链编译，测试运行在 JDK 8）
+./gradlew test
+
+# 在其他 JDK 上运行测试（自动通过工具链解析器下载缺失的 JDK）
+./gradlew test -PtestJavaVersion=21
+
+# 运行 JMH 基准测试（默认全量，含 GC profiler）
+./gradlew jmhRun
+
+# 只跑某个基准，自定义迭代参数
+./gradlew jmhRun -PjmhArgs="DispatchBenchmark.dispatchSingleHandler -f 1 -wi 3 -i 5"
+```
+
+CI 在 GitHub Actions 上于 JDK 8 / 11 / 17 / 21 / 25 矩阵自动执行 `test`，配置见 `.github/workflows/ci.yml`。
+
+### 基准测试说明
+
+基准源码位于 `src/jmh/java`，包含三组场景：
+
+| 基准 | 场景 | 回答的问题 |
+|---|---|---|
+| `DispatchBenchmark.dispatchSingleHandler` | 单监听器稳态派发 | 热路径下限开销（本机参考值约 110 ns/op） |
+| `DispatchBenchmark.dispatchTenHandlers` | 10 个同类型监听器 | 监听器数量的边际成本 |
+| `DispatchBenchmark.dispatchCachedHierarchy` | 父子类型继承分发（缓存命中） | 继承快照缓存的稳态成本 |
+| `SubscriptionChurnBenchmark.subscribeDispatchUnsubscribe` | 注册 8 个 → 派发 → 全部注销 | 注册风暴下的缓存失效策略成本 |
+| `SubscriptionChurnBenchmark.dispatchWithChurn` | 稳态派发中夹杂单次注册/注销 | 动态订阅对稳态分发的干扰 |
+
+以上数字仅为单机参考，结果依赖 JVM 预热、硬件与运行参数；请以 `-f 3 -wi 5 -i 10` 的完整运行结果为准，不要引用烟雾测试数字做结论。

@@ -23,6 +23,9 @@ import java.util.function.Predicate;
  */
 public final class SubscriberBuilder<T extends Event> {
 
+    private static final java.util.logging.Logger LOGGER =
+            java.util.logging.Logger.getLogger(SubscriberBuilder.class.getName());
+
     private final EventManager bus;
     private final Class<T> eventType;
     private int priority = Priority.NORMAL;
@@ -349,7 +352,9 @@ public final class SubscriberBuilder<T extends Event> {
                 if (toDispatch != null && !toDispatch.isEmpty()) {
                     try {
                         batchAction.accept(toDispatch);
-                    } catch (Throwable ignored) {}
+                    } catch (Throwable t) {
+                        LOGGER.log(java.util.logging.Level.WARNING, "Batch handler failed for " + eventType.getName(), t);
+                    }
                 }
             }
         };
@@ -376,7 +381,9 @@ public final class SubscriberBuilder<T extends Event> {
                 if (toDispatch != null) {
                     try {
                         batchAction.accept(toDispatch);
-                    } catch (Throwable ignored) {}
+                    } catch (Throwable t) {
+                        LOGGER.log(java.util.logging.Level.WARNING, "Batch handler failed for " + eventType.getName(), t);
+                    }
                 }
             }
         };

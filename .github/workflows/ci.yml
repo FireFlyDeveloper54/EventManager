@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    name: Test on JDK ${{ matrix.test-java }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test-java: [ 8, 11, 17, 21, 25 ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Gradle 9.x itself needs JDK 17+; the test JVM is selected via
+      # -PtestJavaVersion and auto-provisioned by the foojay toolchain resolver.
+      - name: Set up Gradle JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up test JDK ${{ matrix.test-java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.test-java }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run tests
+        run: ./gradlew test -PtestJavaVersion=${{ matrix.test-java }} --console=plain
+
+      - name: Upload test report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-jdk-${{ matrix.test-java }}
+          path: build/reports/tests/test/
+          retention-days: 7
