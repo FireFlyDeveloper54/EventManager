@@ -63,9 +63,9 @@ final class EventTransactions {
                     HOLDER.remove();
                     for (BufferedEvent be : toFlush) {
                         if (be.exact) {
-                            bus.callExact(be.event);
+                            bus.dispatchExact(be.event);
                         } else {
-                            bus.call(be.event);
+                            bus.dispatch(be.event);
                         }
                     }
                     for (Runnable commitHook : tx.commitHooks) {

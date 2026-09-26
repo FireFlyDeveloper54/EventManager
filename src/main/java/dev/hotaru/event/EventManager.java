@@ -185,7 +185,7 @@ public class EventManager implements AutoCloseable {
         this.metricsEnabled = metricsEnabled;
     }
 
-    public void setErrorHandler(EventErrorHandler errorHandler) {
+    void setErrorHandler(EventErrorHandler errorHandler) {
         this.errorHandler = errorHandler != null ? errorHandler : DEFAULT_ERROR_HANDLER;
     }
 
@@ -214,7 +214,7 @@ public class EventManager implements AutoCloseable {
         return errorPolicy;
     }
 
-    public void setErrorPolicy(ErrorPolicy errorPolicy) {
+    void setErrorPolicy(ErrorPolicy errorPolicy) {
         this.errorPolicy = errorPolicy != null ? errorPolicy : ErrorPolicy.CONTINUE;
     }
 
@@ -295,7 +295,7 @@ public class EventManager implements AutoCloseable {
         return closed;
     }
 
-    public void setDeadEventsEnabled(boolean deadEventsEnabled) {
+    void setDeadEventsEnabled(boolean deadEventsEnabled) {
         this.deadEventsEnabled = deadEventsEnabled;
     }
 
@@ -353,88 +353,162 @@ public class EventManager implements AutoCloseable {
         }
     }
 
-    public void register(Object listener) {
-        register(listener, (Class<? extends Event>) null);
+    /**
+     * Registers an annotated listener and returns a subscription handle.
+     * Registering the same listener instance again is a no-op: handler
+     * equality deduplicates, and the returned handle is a NOOP subscription.
+     *
+     * @param listener the listener object (annotated methods/fields are bound)
+     * @return a subscription handle; {@link Subscription#NOOP} when already registered
+     */
+    public Subscription register(Object listener) {
+        return register(listener, (Class<? extends Event>) null);
     }
 
-    public void register(Object listener, Class<? extends Event> eventClass) {
+    /**
+     * Registers a listener, optionally restricted to handlers bound for the
+     * exact event class. Consumer listeners require a non-null event class and
+     * may be registered multiple times (each call yields an independent
+     * subscription); annotated listeners are deduplicated per instance.
+     */
+    public Subscription register(Object listener, Class<? extends Event> eventClass) {
         if (listener == null) {
-            return;
+            return Subscription.NOOP;
         }
         if (listener instanceof Consumer<?>) {
             if (eventClass == null) {
-                return;
+                return Subscription.NOOP;
             }
             @SuppressWarnings("unchecked")
             Consumer<Event> consumer = (Consumer<Event>) listener;
             @SuppressWarnings("unchecked")
             Class<Event> evt = (Class<Event>) eventClass;
-            register(evt, consumer);
-            return;
+            return register(evt, consumer);
         }
         if (listener instanceof Class<?>) {
-            register((Class<?>) listener, eventClass);
-            return;
+            return register((Class<?>) listener, eventClass);
         }
-        bindListenerPlan(listener, listenerPlanFor(listener.getClass()), eventClass, false, false);
+        if (eventClass == null ? isRegistered(listener) : isRegistered(listener, eventClass)) {
+            return Subscription.NOOP;
+        }
+        bindListener(listener, eventClass, false);
+        return ownedSubscription(handlersForListener(listener, eventClass));
     }
 
     /**
      * Registers an object listener using a weak reference to prevent memory leaks.
      * When the listener is garbage collected, its handlers will automatically deactivate.
+     *
+     * <p><b>Warning:</b> do not pass an inline lambda here — nothing else
+     * references it and it may be collected immediately. Keep the listener in
+     * a field or variable that outlives the subscription.
      */
-    public void registerWeak(Object listener) {
-        registerWeak(listener, (Class<? extends Event>) null);
+    public Subscription registerWeak(Object listener) {
+        return registerWeak(listener, (Class<? extends Event>) null);
     }
 
     /**
      * Registers an object listener weakly for a specific event class.
      */
-    public void registerWeak(Object listener, Class<? extends Event> eventClass) {
+    public Subscription registerWeak(Object listener, Class<? extends Event> eventClass) {
         if (listener == null) {
-            return;
+            return Subscription.NOOP;
         }
         if (listener instanceof Consumer<?>) {
             if (eventClass == null) {
-                return;
+                return Subscription.NOOP;
             }
             @SuppressWarnings("unchecked")
             Consumer<Event> consumer = (Consumer<Event>) listener;
             @SuppressWarnings("unchecked")
             Class<Event> evt = (Class<Event>) eventClass;
-            registerWeak(evt, consumer);
-            return;
+            return registerWeak(evt, consumer);
         }
         if (listener instanceof Class<?>) {
-            register((Class<?>) listener, eventClass);
-            return;
+            return register((Class<?>) listener, eventClass);
         }
-        bindListenerPlan(listener, listenerPlanFor(listener.getClass()), eventClass, false, true);
+        if (eventClass == null ? isRegistered(listener) : isRegistered(listener, eventClass)) {
+            return Subscription.NOOP;
+        }
+        bindListener(listener, eventClass, true);
+        return ownedSubscription(handlersForListener(listener, eventClass));
     }
 
-    public void register(Class<?> listenerClass) {
-        register(listenerClass, (Class<? extends Event>) null);
+    /**
+     * Registers all static handlers of a listener class.
+     */
+    public Subscription register(Class<?> listenerClass) {
+        return register(listenerClass, (Class<? extends Event>) null);
     }
 
-    public void register(Class<?> listenerClass, Class<? extends Event> eventClass) {
+    /**
+     * Registers all static handlers of a listener class, optionally restricted
+     * to the exact event class. Registering the same class again is a no-op.
+     */
+    public Subscription register(Class<?> listenerClass, Class<? extends Event> eventClass) {
         if (listenerClass == null) {
-            return;
+            return Subscription.NOOP;
+        }
+        if (isRegistered(listenerClass, eventClass)) {
+            return Subscription.NOOP;
         }
         bindListenerPlan(listenerClass, listenerPlanFor(listenerClass), eventClass, true);
+        return ownedSubscription(handlersForListener(listenerClass, eventClass));
     }
 
-    public void register(Object listener, Method method) {
+    private void bindListener(Object listener, Class<? extends Event> eventClass, boolean weak) {
+        if (listener instanceof Class<?>) {
+            Class<?> listenerClass = (Class<?>) listener;
+            bindListenerPlan(listenerClass, listenerPlanFor(listenerClass), eventClass, true);
+            return;
+        }
+        bindListenerPlan(listener, listenerPlanFor(listener.getClass()), eventClass, false, weak);
+    }
+
+    public Subscription register(Object listener, Method method) {
         if (listener == null || method == null) {
-            return;
+            return Subscription.NOOP;
         }
+        Handler[] before = handlersForListener(listener, null);
         bindMatchingDefinitions(listener, method, null, listener instanceof Class<?>);
+        return ownedSubscription(addedHandlers(before, handlersForListener(listener, null)));
     }
 
-    public void register(Object listener, Field field) {
+    public Subscription register(Object listener, Field field) {
         if (listener == null || field == null) {
-            return;
+            return Subscription.NOOP;
         }
+        Handler[] before = handlersForListener(listener, null);
         bindMatchingDefinitions(listener, null, field, listener instanceof Class<?>);
+        return ownedSubscription(addedHandlers(before, handlersForListener(listener, null)));
+    }
+
+    private static Handler[] addedHandlers(Handler[] before, Handler[] after) {
+        int added = 0;
+        outer:
+        for (int i = 0; i < after.length; i++) {
+            for (int k = 0; k < before.length; k++) {
+                if (after[i] == before[k]) {
+                    continue outer;
+                }
+            }
+            added++;
+        }
+        if (added == 0) {
+            return NO_HANDLERS;
+        }
+        Handler[] result = new Handler[added];
+        int w = 0;
+        outer2:
+        for (int i = 0; i < after.length; i++) {
+            for (int k = 0; k < before.length; k++) {
+                if (after[i] == before[k]) {
+                    continue outer2;
+                }
+            }
+            result[w++] = after[i];
+        }
+        return result;
     }
 
     public <T extends Event> Subscription register(Class<T> eventType, Consumer<? super T> action) {
@@ -547,16 +621,23 @@ public class EventManager implements AutoCloseable {
         return new HandlerSubscription(handler);
     }
 
+    /**
+     * Registers a {@link Consumer} handler that is referenced <em>weakly</em>:
+     * the bus holds no strong reference to it, so once the caller drops all
+     * references the handler is garbage collected and silently stops firing.
+     *
+     * <p><b>Warning:</b> do not pass an inline lambda here, e.g.
+     * {@code registerWeak(Ping.class, e -> handle(e))}. A stateless lambda has
+     * no other reference anywhere in the program and may be collected
+     * immediately. Keep the consumer in a field or local variable that
+     * outlives the subscription.
+     *
+     * @param eventType the event class to listen for
+     * @param action    the weakly-referenced handler
+     * @param <T>       the event type
+     * @return a subscription handle for explicit unregistration
+     */
     public <T extends Event> Subscription registerWeak(Class<T> eventType, Consumer<? super T> action) {
-        return registerWeak(eventType, DEFAULT_PRIORITY, false, action);
-    }
-
-    public <T extends Event> Subscription registerWeak(Class<T> eventType, int priority, Consumer<? super T> action) {
-        return registerWeak(eventType, priority, false, action);
-    }
-
-    public <T extends Event> Subscription registerWeak(final Class<T> eventType, int priority,
-                                                       boolean ignoreCancelled, final Consumer<? super T> action) {
         if (eventType == null || action == null) {
             return Subscription.NOOP;
         }
@@ -569,8 +650,8 @@ public class EventManager implements AutoCloseable {
                 null,
                 null,
                 eventType,
-                normalizePriority(priority),
-                ignoreCancelled,
+                DEFAULT_PRIORITY,
+                false,
                 registrationOrder.getAndIncrement(),
                 false,
                 null,
@@ -587,6 +668,7 @@ public class EventManager implements AutoCloseable {
         addHandler(handler);
         return new HandlerSubscription(handler);
     }
+
 
     public <T extends Event> Subscription registerListener(Class<T> eventType,
                                                            EventListener<? super T> listener) {
@@ -729,97 +811,6 @@ public class EventManager implements AutoCloseable {
             }
         }
         return Subscriptions.combine(subscriptions.toArray(new Subscription[subscriptions.size()]));
-    }
-
-    public Subscription subscribe(Object listener) {
-        if (listener == null) {
-            return Subscription.NOOP;
-        }
-        if (listener instanceof Class<?>) {
-            return subscribe((Class<?>) listener);
-        }
-        // No lock needed: insertHandler() deduplicates equal handlers, so a
-        // racing double subscribe cannot register the listener twice.
-        if (isRegistered(listener)) {
-            return Subscription.NOOP;
-        }
-        register(listener);
-        return ownedSubscription(handlersForListener(listener, null));
-    }
-
-    public Subscription subscribe(Class<?> listenerClass) {
-        if (listenerClass == null) {
-            return Subscription.NOOP;
-        }
-        if (isRegistered(listenerClass)) {
-            return Subscription.NOOP;
-        }
-        register(listenerClass);
-        return ownedSubscription(handlersForListener(listenerClass, null));
-    }
-
-    public Subscription subscribe(Object listener, Class<? extends Event> eventClass) {
-        if (listener == null || eventClass == null) {
-            return Subscription.NOOP;
-        }
-        if (listener instanceof Consumer<?>) {
-            @SuppressWarnings("unchecked")
-            Consumer<Event> consumer = (Consumer<Event>) listener;
-            @SuppressWarnings("unchecked")
-            Class<Event> evt = (Class<Event>) eventClass;
-            return register(evt, consumer);
-        }
-        if (isRegistered(listener, eventClass)) {
-            return Subscription.NOOP;
-        }
-        if (listener instanceof Class<?>) {
-            register((Class<?>) listener, eventClass);
-        } else {
-            register(listener, eventClass);
-        }
-        return ownedSubscription(handlersForListener(listener, eventClass));
-    }
-
-    /**
-     * Subscribes an object listener weakly, returning a subscription.
-     */
-    public Subscription subscribeWeak(Object listener) {
-        if (listener == null) {
-            return Subscription.NOOP;
-        }
-        if (listener instanceof Class<?>) {
-            return subscribe((Class<?>) listener);
-        }
-        if (isRegistered(listener)) {
-            return Subscription.NOOP;
-        }
-        registerWeak(listener);
-        return ownedSubscription(handlersForListener(listener, null));
-    }
-
-    /**
-     * Subscribes an object listener weakly for a specific event class.
-     */
-    public Subscription subscribeWeak(Object listener, Class<? extends Event> eventClass) {
-        if (listener == null || eventClass == null) {
-            return Subscription.NOOP;
-        }
-        if (listener instanceof Consumer<?>) {
-            @SuppressWarnings("unchecked")
-            Consumer<Event> consumer = (Consumer<Event>) listener;
-            @SuppressWarnings("unchecked")
-            Class<Event> evt = (Class<Event>) eventClass;
-            return registerWeak(evt, consumer);
-        }
-        if (isRegistered(listener, eventClass)) {
-            return Subscription.NOOP;
-        }
-        if (listener instanceof Class<?>) {
-            register((Class<?>) listener, eventClass);
-        } else {
-            registerWeak(listener, eventClass);
-        }
-        return ownedSubscription(handlersForListener(listener, eventClass));
     }
 
     private Subscription ownedSubscription(Handler[] handlers) {
@@ -1195,7 +1186,7 @@ public class EventManager implements AutoCloseable {
      * @param <T>   the event type
      * @return the dispatched event, for chaining
      */
-    public <T extends Event> T call(T event) {
+    public <T extends Event> T dispatch(T event) {
         if (event == null || closed) {
             return event;
         }
@@ -1229,13 +1220,13 @@ public class EventManager implements AutoCloseable {
                     EventUpcaster.Typed<Object, Object> typed = (EventUpcaster.Typed<Object, Object>) upcaster;
                     Object upcasted = typed.upcast(event);
                     if (upcasted instanceof Event) {
-                        call((Event) upcasted);
+                        dispatch((Event) upcasted);
                     }
                 }
             } else if (parent != null) {
-                parent.call(event);
+                parent.dispatch(event);
             } else if (deadEventsEnabled && !(event instanceof DeadEvent) && hasListeners(DeadEvent.class)) {
-                call(new DeadEvent(this, event, EventTrace.capture()));
+                dispatch(new DeadEvent(this, event, EventTrace.capture()));
             }
             return event;
         }
@@ -1254,7 +1245,7 @@ public class EventManager implements AutoCloseable {
                 EventUpcaster.Typed<Object, Object> typed = (EventUpcaster.Typed<Object, Object>) upcaster;
                 Object upcasted = typed.upcast(event);
                 if (upcasted instanceof Event) {
-                    call((Event) upcasted);
+                    dispatch((Event) upcasted);
                 }
             }
         }
@@ -1268,19 +1259,19 @@ public class EventManager implements AutoCloseable {
                 canBubble = false;
             }
             if (canBubble) {
-                parent.call(event);
+                parent.dispatch(event);
             }
         }
 
         return event;
     }
 
-    public <T extends Event> T call(T event, Runnable afterDispatch) {
+    public <T extends Event> T dispatch(T event, Runnable afterDispatch) {
         if (event == null) {
             return null;
         }
         try {
-            return call(event);
+            return dispatch(event);
         } finally {
             if (afterDispatch != null) {
                 afterDispatch.run();
@@ -1288,7 +1279,7 @@ public class EventManager implements AutoCloseable {
         }
     }
 
-    public <T extends Event> T callExact(T event) {
+    public <T extends Event> T dispatchExact(T event) {
         if (event == null || closed) {
             return event;
         }
@@ -1324,20 +1315,20 @@ public class EventManager implements AutoCloseable {
                 recordDuration(event.getClass(), System.nanoTime() - startNanos);
             }
             if (parent != null) {
-                parent.callExact(event);
+                parent.dispatchExact(event);
             } else if (deadEventsEnabled && !(event instanceof DeadEvent) && hasListeners(DeadEvent.class)) {
-                call(new DeadEvent(this, event, EventTrace.capture()));
+                dispatch(new DeadEvent(this, event, EventTrace.capture()));
             }
         }
         return event;
     }
 
-    public <T extends Event> T callExact(T event, Runnable afterDispatch) {
+    public <T extends Event> T dispatchExact(T event, Runnable afterDispatch) {
         if (event == null) {
             return null;
         }
         try {
-            return callExact(event);
+            return dispatchExact(event);
         } finally {
             if (afterDispatch != null) {
                 afterDispatch.run();
@@ -1348,25 +1339,25 @@ public class EventManager implements AutoCloseable {
     /**
      * Dispatches a cancellable event and returns whether it was cancelled.
      */
-    public <T extends Event & Cancellable> boolean callCancelled(T event) {
+    public <T extends Event & Cancellable> boolean dispatchCancelled(T event) {
         if (event == null) {
             return false;
         }
-        call(event);
+        dispatch(event);
         return event.isCancelled();
     }
 
     /**
      * Dispatches multiple events in sequential order.
      */
-    public void callAll(Event... events) {
+    public void dispatchAll(Event... events) {
         if (events == null || events.length == 0) {
             return;
         }
         for (int i = 0; i < events.length; i++) {
             Event event = events[i];
             if (event != null) {
-                call(event);
+                dispatch(event);
             }
         }
     }
@@ -1374,13 +1365,13 @@ public class EventManager implements AutoCloseable {
     /**
      * Dispatches an iterable collection of events in sequential order.
      */
-    public void callAll(Iterable<? extends Event> events) {
+    public void dispatchAll(Iterable<? extends Event> events) {
         if (events == null) {
             return;
         }
         for (Event event : events) {
             if (event != null) {
-                call(event);
+                dispatch(event);
             }
         }
     }
@@ -1388,29 +1379,29 @@ public class EventManager implements AutoCloseable {
     /**
      * Dispatches an event asynchronously using ForkJoinPool.commonPool().
      */
-    public <T extends Event> CompletableFuture<T> callAsync(final T event) {
-        return callAsync(event, this.defaultExecutor);
+    public <T extends Event> CompletableFuture<T> dispatchAsync(final T event) {
+        return dispatchAsync(event, this.defaultExecutor);
     }
 
     /**
      * Dispatches an event through the supplied executor. The returned future
      * completes with the same event instance after dispatch finishes.
      */
-    public <T extends Event> CompletableFuture<T> callAsync(final T event, Executor executor) {
+    public <T extends Event> CompletableFuture<T> dispatchAsync(final T event, Executor executor) {
         return submit(event, executor, false);
     }
 
     /**
      * Dispatches an event to exact-type handlers asynchronously using ForkJoinPool.commonPool().
      */
-    public <T extends Event> CompletableFuture<T> callExactAsync(final T event) {
-        return callExactAsync(event, this.defaultExecutor);
+    public <T extends Event> CompletableFuture<T> dispatchExactAsync(final T event) {
+        return dispatchExactAsync(event, this.defaultExecutor);
     }
 
     /**
      * Dispatches an event to exact-type handlers through the supplied executor.
      */
-    public <T extends Event> CompletableFuture<T> callExactAsync(final T event, Executor executor) {
+    public <T extends Event> CompletableFuture<T> dispatchExactAsync(final T event, Executor executor) {
         return submit(event, executor, true);
     }
 
@@ -1434,7 +1425,7 @@ public class EventManager implements AutoCloseable {
                             ? callingContext.attach()
                             : null;
                     try {
-                        future.complete(exact ? callExact(event) : call(event));
+                        future.complete(exact ? dispatchExact(event) : dispatch(event));
                     } catch (Throwable t) {
                         future.completeExceptionally(t);
                     } finally {
@@ -1450,18 +1441,18 @@ public class EventManager implements AutoCloseable {
         return future;
     }
 
-    public <T extends Event> T call(Class<T> eventType, Supplier<T> supplier) {
+    public <T extends Event> T dispatch(Class<T> eventType, Supplier<T> supplier) {
         if (eventType == null || supplier == null || !hasListeners(eventType)) {
             return null;
         }
-        return call(supplier.get());
+        return dispatch(supplier.get());
     }
 
-    public <T extends Event> T callExact(Class<T> eventType, Supplier<T> supplier) {
+    public <T extends Event> T dispatchExact(Class<T> eventType, Supplier<T> supplier) {
         if (eventType == null || supplier == null || !hasExactListeners(eventType)) {
             return null;
         }
-        return callExact(supplier.get());
+        return dispatchExact(supplier.get());
     }
 
     private static final class DispatchFrame implements Runnable {
@@ -2755,84 +2746,6 @@ public class EventManager implements AutoCloseable {
     // ==========================================
     // Standard Dispatch API Aliases
     // ==========================================
-
-    /**
-     * Standard alias for {@link #call(Event)}.
-     */
-    public <T extends Event> T dispatch(T event) {
-        return call(event);
-    }
-
-    /**
-     * Standard alias for {@link #call(Event, Runnable)}.
-     */
-    public <T extends Event> T dispatch(T event, Runnable afterDispatch) {
-        return call(event, afterDispatch);
-    }
-
-    /**
-     * Standard alias for {@link #callExact(Event)}.
-     */
-    public <T extends Event> T dispatchExact(T event) {
-        return callExact(event);
-    }
-
-    /**
-     * Standard alias for {@link #callExact(Event, Runnable)}.
-     */
-    public <T extends Event> T dispatchExact(T event, Runnable afterDispatch) {
-        return callExact(event, afterDispatch);
-    }
-
-    /**
-     * Standard alias for {@link #callAsync(Event)}.
-     */
-    public <T extends Event> CompletableFuture<T> dispatchAsync(T event) {
-        return callAsync(event);
-    }
-
-    /**
-     * Standard alias for {@link #callAsync(Event, Executor)}.
-     */
-    public <T extends Event> CompletableFuture<T> dispatchAsync(T event, Executor executor) {
-        return callAsync(event, executor);
-    }
-
-    /**
-     * Standard alias for {@link #callExactAsync(Event)}.
-     */
-    public <T extends Event> CompletableFuture<T> dispatchExactAsync(T event) {
-        return callExactAsync(event);
-    }
-
-    /**
-     * Standard alias for {@link #callExactAsync(Event, Executor)}.
-     */
-    public <T extends Event> CompletableFuture<T> dispatchExactAsync(T event, Executor executor) {
-        return callExactAsync(event, executor);
-    }
-
-    /**
-     * Standard alias for {@link #callAll(Event...)}.
-     */
-    public void dispatchAll(Event... events) {
-        callAll(events);
-    }
-
-    /**
-     * Standard alias for {@link #callAll(Iterable)}.
-     */
-    public void dispatchAll(Iterable<? extends Event> events) {
-        callAll(events);
-    }
-
-    /**
-     * Standard alias for {@link #callCancelled(Event)}.
-     */
-    public <T extends Event & Cancellable> boolean dispatchCancelled(T event) {
-        return callCancelled(event);
-    }
-
 
     static ScheduledExecutorService getTimeoutScheduler() {
         return TimeoutScheduler.scheduler();

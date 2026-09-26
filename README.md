@@ -1,6 +1,6 @@
 # EventManager
 
-一个无任何第三方依赖（100% 纯 JDK 原生标准库实现，零编译期/运行时外部依赖）、基于注解与 Lambda 的高性能通用 Java 事件总线，全面兼容 JDK 8 至 JDK 25（兼容性由 CI 在 JDK 8/11/17/21/25 矩阵上自动验证，性能数据见文末「基准测试」）。
+一个无任何第三方依赖（100% 纯 JDK 原生标准库实现，零编译期/运行时外部依赖）、基于注解与 Lambda 的高性能通用 Java 事件总线，全面兼容 JDK 8 至 JDK 25（多版本兼容可用一条命令本地验证，见文末「构建 / 测试 / 基准测试」；性能数据见「基准测试」）。
 
 ## 核心特性
 
@@ -28,13 +28,13 @@
 - **聚合异常传播策略**：新增 `ErrorPolicy.AGGREGATE`，分发时不阻断后续处理器，分发结束后利用原生 `Throwable.addSuppressed(...)` 将所有失败聚合为结构化 `EventDispatchException` 抛给调用方。
 - **事务性事件缓冲与回滚**：原生提供线程隔离的事件事务（`bus.transaction(...)`），代码块正常结束原子批量 flush；若中途报错或显式回滚，所有缓冲事件自动丢弃（Rollback），杜绝业务脏状态副作用扩散。
 - **无锁并发**：处理器增删采用 CAS 无锁写时复制（COW）循环，杜绝 `ConcurrentModificationException`；分发快照读取全程无锁，监听器查重基于 Handler 等值去重而非全局互斥锁。
-- **内存安全**：原生支持弱引用托管（`registerWeak` / `subscribeWeak` / `.weak()`），提供主动死引用清理（`purgeDeadHandlers`），彻底消除长生命周期事件总线导致的 *Lapsed Listener* 内存残留。
+- **内存安全**：原生支持弱引用托管（`registerWeak` / `.weak()`），提供主动死引用清理（`purgeDeadHandlers`），彻底消除长生命周期事件总线导致的 *Lapsed Listener* 内存残留。
 - **死信检测**：原生支持 `DeadEvent` 未处理事件感知，防止复杂系统与插件架构中事件因时序颠倒而静默丢失。
 - **声明式过滤**：支持 `@EventTarget(filter = MyFilter.class)`，以声明方式将事件过滤器绑定至监听器；支持逻辑运算与 JDK `Predicate` 无缝互通。
 - **零分配拦截器**：提供 `EventInterceptor` 与 `EventInterceptors.chain` 管道组合器，基于轻量可重入执行帧栈（`DispatchFrame`）实现分发热路径 **0 堆对象分配（Zero Heap Allocation）**。
 - **线程亲和性**：支持配置 `enforceThread(...)`，在非法线程派发时即时抛出明确诊断异常，彻底杜绝游戏/UI 主线程竞态。
 - **分层作用域**：支持 `createChildBus()` 创建子总线，事件就地处理后向上冒泡，子模块关闭时一键解绑并释放全部资源。
-- **行业生态对齐**：全面提供与 Guava / Spring 习惯一致的 `dispatch(...)`、`dispatchAsync(...)` 等一等公民方法别名。
+- **API 单一无别名**：对外仅一套 `dispatch(...)` 命名（Guava / Spring 风格），无同义方法冗余；所有注册路径统一返回 `Subscription` 句柄。
 - **可观察性**：支持总线命名与结构化诊断（`toString()`），内置 APM 延迟分析器，纳秒级记录各事件类型的累计总耗时、峰值耗时（Max Spike）与平均延迟。
 
 ## 进阶与常用用法
@@ -442,11 +442,11 @@ session.replayTo(mockBus); // 完全无损重现当时的事件链路与上下�
 | `ChurnVsDispatchRace` | 一线程循环注册/注销、另一线程连续分发 10 次：构造期注册的稳定监听器**每次分发恰好收到一次**，无 CME/NPE 泄漏（并发缓存失效不破坏快照读取） |
 
 ```bash
-./gradlew jcstressRun                # quick profile（CI 默认）
+./gradlew jcstressRun                # quick profile（快速验证）
 ./gradlew jcstressRun -PjcstressArgs="-iters 5 -time 1000"   # 更高置信度
 ```
 
-jcstress 在 JDK 17 上运行（框架要求），被测代码仍是 Java 8 字节码；CI 中为独立 job。
+jcstress 在 JDK 17 上运行（框架要求），被测代码仍是 Java 8 字节码。
 
 ## 与 Guava EventBus 对比
 
@@ -483,7 +483,11 @@ jcstress 在 JDK 17 上运行（框架要求），被测代码仍是 Java 8 字�
 ./gradlew jmhRun -PjmhArgs="DispatchBenchmark.dispatchSingleHandler -f 1 -wi 3 -i 5"
 ```
 
-CI 在 GitHub Actions 上于 JDK 8 / 11 / 17 / 21 / 25 矩阵自动执行 `test`，配置见 `.github/workflows/ci.yml`。
+多版本兼容验证在本地逐个执行即可（工具链会自动下载缺失的 JDK）：
+
+```bash
+for v in 8 11 17 21 25; do ./gradlew test -PtestJavaVersion=$v; done
+```
 
 ### 基准测试说明
 

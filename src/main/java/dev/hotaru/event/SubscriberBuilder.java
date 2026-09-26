@@ -46,6 +46,7 @@ public final class SubscriberBuilder<T extends Event> {
     private long bufferTimeout = 0L;
     private TimeUnit bufferUnit = null;
     private RetryPolicy retryPolicy = null;
+    private RetryPolicy retryAsyncPolicy = null;
 
     SubscriberBuilder(EventManager bus, Class<T> eventType) {
         this.bus = Objects.requireNonNull(bus, "bus");
@@ -99,7 +100,15 @@ public final class SubscriberBuilder<T extends Event> {
     }
 
     /**
-     * Configures this subscriber to be referenced weakly.
+     * Configures this subscriber to be referenced weakly: once the handler
+     * (or its owning object) has no strong references left, it is garbage
+     * collected and silently stops receiving events.
+     *
+     * <p><b>Warning:</b> combined with an inline lambda, e.g.
+     * {@code bus.on(Ping.class).weak().handle(e -> handle(e))}, nothing else
+     * references the handler and it may be collected immediately. Keep the
+     * handler in a field or variable that outlives the subscription, or use
+     * weak() only with an annotated listener object you hold a reference to.
      */
     public SubscriberBuilder<T> weak() {
         return weak(true);
@@ -187,8 +196,13 @@ public final class SubscriberBuilder<T extends Event> {
 
     /**
      * Adds an {@link EventFilter}. If a filter already exists, the new filter is AND-composed.
+     *
+     * <p>This overload lives on a distinct name because both {@link Predicate}
+     * and {@link EventFilter} are functional interfaces: on a shared name, a
+     * bare lambda argument would be ambiguous and fail to compile. Name the
+     * lambda's type or use {@link #filter(Predicate)} for lambdas.
      */
-    public SubscriberBuilder<T> filter(final EventFilter<? super T> filter) {
+    public SubscriberBuilder<T> filterWith(final EventFilter<? super T> filter) {
         if (filter != null) {
             return filter(new Predicate<T>() {
                 @Override
@@ -315,6 +329,28 @@ public final class SubscriberBuilder<T extends Event> {
     }
 
     /**
+     * Attaches a <strong>non-blocking</strong> retry policy: on failure the next
+     * attempt is scheduled on the shared timeout scheduler and the dispatch
+     * continues immediately instead of sleeping the dispatch thread. Retried
+     * attempts therefore run out of band and may interleave with other events.
+     *
+     * <p>Once all attempts are exhausted the last failure is routed to the
+     * bus's {@link EventErrorHandler} (there is no dispatch stack left to
+     * propagate to).
+     */
+    public SubscriberBuilder<T> retryAsync(RetryPolicy policy) {
+        this.retryAsyncPolicy = policy;
+        return this;
+    }
+
+    /**
+     * Non-blocking retry, see {@link #retryAsync(RetryPolicy)}.
+     */
+    public SubscriberBuilder<T> retryAsync(int maxAttempts, long delay, TimeUnit unit) {
+        return retryAsync(RetryPolicy.fixed(maxAttempts, delay, unit));
+    }
+
+    /**
      * Registers a micro-batching handler consuming batches of events.
      * If {@link #buffer(int, long, TimeUnit)} was not configured, defaults to 100 events or 50ms.
      */
@@ -401,11 +437,41 @@ public final class SubscriberBuilder<T extends Event> {
         };
     }
 
+    private static <T extends Event> void attemptAsync(
+            final EventManager bus, final T event, final Consumer<? super T> action,
+            final RetryPolicy policy, final int attempt) {
+        try {
+            action.accept(event);
+        } catch (Throwable failure) {
+            if (!policy.canRetry(failure, attempt)) {
+                EventManager.notifyHandlerFailure(bus, event, action, failure);
+                return;
+            }
+            final long delayNanos = Math.max(0L, policy.getDelayNanosForAttempt(attempt + 1));
+            final long delayMillis = (delayNanos + 999_999L) / 1_000_000L;
+            EventManager.getTimeoutScheduler().schedule(new Runnable() {
+                @Override
+                public void run() {
+                    attemptAsync(bus, event, action, policy, attempt + 1);
+                }
+            }, delayMillis, TimeUnit.MILLISECONDS);
+        }
+    }
+
     public Subscription handle(Consumer<? super T> action) {
         Objects.requireNonNull(action, "action");
 
-        // Wrap with RetryPolicy if configured
-        if (this.retryPolicy != null) {
+        // Wrap with non-blocking retry if configured
+        if (this.retryAsyncPolicy != null) {
+            final RetryPolicy rp = this.retryAsyncPolicy;
+            final Consumer<? super T> prevAction = action;
+            action = new Consumer<T>() {
+                @Override
+                public void accept(final T event) {
+                    attemptAsync(bus, event, prevAction, rp, 1);
+                }
+            };
+        } else if (this.retryPolicy != null) {
             final RetryPolicy rp = this.retryPolicy;
             final Consumer<? super T> prevAction = action;
             action = new Consumer<T>() {

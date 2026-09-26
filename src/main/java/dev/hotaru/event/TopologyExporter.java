@@ -65,6 +65,10 @@ public final class TopologyExporter {
             sb.append("    class ").append(ev).append(" event;\n");
         }
 
+        for (String listenerNode : declaredListeners) {
+            sb.append("    class ").append(listenerNode).append(" listener;\n");
+        }
+
         sb.append("```");
         return sb.toString();
     }

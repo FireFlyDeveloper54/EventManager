@@ -56,6 +56,13 @@ tasks.register('jcstressRun', JavaExec) {
     }
 }
 
+tasks.register('demoRun', JavaExec) {
+    group = 'demo'
+    description = 'Runs the quick-start demo (src/test/java/dev/hotaru/event/QuickStartDemo.java).'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.hotaru.event.QuickStartDemo'
+}
+
 tasks.register('jmhRun', JavaExec) {
     group = 'benchmark'
     description = 'Runs JMH benchmarks. Usage: ./gradlew jmhRun -PjmhArgs="DispatchBenchmark.* -f 1 -wi 3 -i 5"'
@@ -114,6 +121,16 @@ publishing {
     publications {
         maven(MavenPublication) {
             from components.java
+            pom {
+                name = 'EventManager'
+                description = 'A zero-dependency, annotation- and lambda-based, high-performance general-purpose event bus for Java 8+.'
+                licenses {
+                    license {
+                        name = 'The Unlicense'
+                        url = 'https://unlicense.org/'
+                    }
+                }
+            }
         }
     }
 }

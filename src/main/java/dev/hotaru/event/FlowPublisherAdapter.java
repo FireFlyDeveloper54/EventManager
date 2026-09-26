@@ -3,6 +3,7 @@ package dev.hotaru.event;
 import dev.hotaru.event.impl.Event;
 
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.Objects;
@@ -23,6 +24,7 @@ public final class FlowPublisherAdapter {
     private static final Class<?> FLOW_SUBSCRIPTION_CLASS;
     private static final Method ON_SUBSCRIBE_METHOD;
     private static final Method ON_NEXT_METHOD;
+    private static final Method ON_ERROR_METHOD;
 
     static {
         boolean supported = false;
@@ -31,12 +33,14 @@ public final class FlowPublisherAdapter {
         Class<?> subs = null;
         Method onSub = null;
         Method onNxt = null;
+        Method onErr = null;
         try {
             pub = Class.forName("java.util.concurrent.Flow$Publisher");
             sub = Class.forName("java.util.concurrent.Flow$Subscriber");
             subs = Class.forName("java.util.concurrent.Flow$Subscription");
             onSub = sub.getMethod("onSubscribe", subs);
             onNxt = sub.getMethod("onNext", Object.class);
+            onErr = sub.getMethod("onError", Throwable.class);
             supported = true;
         } catch (Throwable ignored) {
             // Flow API not present on JDK 8
@@ -47,6 +51,7 @@ public final class FlowPublisherAdapter {
         FLOW_SUBSCRIPTION_CLASS = subs;
         ON_SUBSCRIBE_METHOD = onSub;
         ON_NEXT_METHOD = onNxt;
+        ON_ERROR_METHOD = onErr;
     }
 
     private FlowPublisherAdapter() {}
@@ -112,6 +117,9 @@ public final class FlowPublisherAdapter {
 
         final AtomicLong demand = new AtomicLong();
         final AtomicBoolean cancelled = new AtomicBoolean();
+        // Spec conformance: events arriving with no outstanding demand must be
+        // buffered, not dropped — otherwise the publisher silently loses events.
+        final java.util.Queue<T> pending = new java.util.concurrent.ConcurrentLinkedQueue<T>();
 
         final Subscription[] busSubRef = new Subscription[1];
 
@@ -121,14 +129,15 @@ public final class FlowPublisherAdapter {
                 String name = method.getName();
                 if ("request".equals(name) && args != null && args.length == 1) {
                     long n = (Long) args[0];
-                    if (n <= 0) {
-                        return null;
+                    if (n > 0) {
+                        demand.addAndGet(n);
+                        drain(busSubRef, subscriber, pending, demand, cancelled);
                     }
-                    demand.addAndGet(n);
                     return null;
                 }
                 if ("cancel".equals(name)) {
                     if (cancelled.compareAndSet(false, true)) {
+                        pending.clear();
                         if (busSubRef[0] != null) {
                             busSubRef[0].unsubscribe();
                         }
@@ -153,19 +162,49 @@ public final class FlowPublisherAdapter {
                 if (cancelled.get()) {
                     return;
                 }
-                long current = demand.get();
-                if (current > 0) {
-                    demand.decrementAndGet();
-                    try {
-                        ON_NEXT_METHOD.invoke(subscriber, event);
-                    } catch (Throwable t) {
-                        cancelled.set(true);
-                        if (busSubRef[0] != null) {
-                            busSubRef[0].unsubscribe();
-                        }
-                    }
-                }
+                pending.add(event);
+                drain(busSubRef, subscriber, pending, demand, cancelled);
             }
         });
+    }
+
+    private static <T extends Event> void drain(
+            final Subscription[] busSubRef,
+            final Object subscriber,
+            final java.util.Queue<T> pending,
+            final AtomicLong demand,
+            final AtomicBoolean cancelled) {
+        T event;
+        while (!cancelled.get() && (event = pending.peek()) != null) {
+            // CAS cap: never deliver more than the requested total, even when
+            // events and request(n) race concurrently.
+            long claimed = demand.getAndUpdate(new java.util.function.LongUnaryOperator() {
+                @Override
+                public long applyAsLong(long d) {
+                    return d > 0 ? d - 1 : d;
+                }
+            });
+            if (claimed <= 0) {
+                return;
+            }
+            pending.poll();
+            try {
+                ON_NEXT_METHOD.invoke(subscriber, event);
+            } catch (Throwable t) {
+                // A failing subscriber must be signalled via onError, not
+                // silently cancelled.
+                cancelled.set(true);
+                pending.clear();
+                if (busSubRef[0] != null) {
+                    busSubRef[0].unsubscribe();
+                }
+                try {
+                    ON_ERROR_METHOD.invoke(subscriber, t instanceof InvocationTargetException ? t.getCause() : t);
+                } catch (Throwable ignored) {
+                    // Nothing left to do: the subscriber is gone either way.
+                }
+                return;
+            }
+        }
     }
 }

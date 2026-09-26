@@ -2,6 +2,7 @@ package dev.hotaru.event;
 
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -44,6 +45,10 @@ public final class CircuitBreaker {
 
     private volatile State state = State.CLOSED;
 
+    // Enforces the "single trial" promise of HALF_OPEN: concurrent callers in
+    // HALF_OPEN are rejected until the active probe reports success or failure.
+    private final AtomicBoolean probeActive = new AtomicBoolean();
+
     public CircuitBreaker(int maxFailures, long cooldown, TimeUnit unit) {
         if (maxFailures <= 0) {
             throw new IllegalArgumentException("maxFailures must be positive");
@@ -54,7 +59,10 @@ public final class CircuitBreaker {
     }
 
     /**
-     * Checks whether an execution attempt is permitted.
+     * Checks whether an execution attempt is permitted. When this returns
+     * {@code true} the caller MUST eventually report the outcome via
+     * {@link #recordSuccess()} or {@link #recordFailure()}, or the HALF_OPEN
+     * probe slot stays occupied.
      */
     public boolean allowExecution() {
         State current = this.state;
@@ -63,20 +71,21 @@ public final class CircuitBreaker {
         }
         if (current == State.OPEN) {
             long elapsed = System.nanoTime() - lastFailureNanos.get();
-            if (elapsed >= cooldownNanos) {
-                this.state = State.HALF_OPEN;
-                return true;
+            if (elapsed < cooldownNanos) {
+                return false;
             }
-            return false;
+            this.state = State.HALF_OPEN;
+            return probeActive.compareAndSet(false, true);
         }
-        // HALF_OPEN allows single trial execution
-        return true;
+        // HALF_OPEN admits exactly one probe at a time.
+        return probeActive.compareAndSet(false, true);
     }
 
     /**
      * Records a successful execution. If currently in {@code HALF_OPEN}, restores to {@code CLOSED}.
      */
     public void recordSuccess() {
+        probeActive.set(false);
         this.failureCount.set(0);
         this.state = State.CLOSED;
     }
@@ -86,6 +95,7 @@ public final class CircuitBreaker {
      */
     public void recordFailure() {
         this.lastFailureNanos.set(System.nanoTime());
+        probeActive.set(false);
         int failures = this.failureCount.incrementAndGet();
         if (failures >= maxFailures) {
             this.state = State.OPEN;
@@ -96,6 +106,7 @@ public final class CircuitBreaker {
      * Resets the circuit breaker back to initial {@code CLOSED} state with zero failures.
      */
     public void reset() {
+        probeActive.set(false);
         this.failureCount.set(0);
         this.lastFailureNanos.set(0);
         this.state = State.CLOSED;
