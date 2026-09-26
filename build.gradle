@@ -16,6 +16,11 @@ sourceSets {
         compileClasspath += sourceSets.main.output
         runtimeClasspath += sourceSets.main.output
     }
+    jcstress {
+        java.srcDirs = ['src/jcstress/java']
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
 }
 
 dependencies {
@@ -23,6 +28,32 @@ dependencies {
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.3'
     jmhImplementation 'org.openjdk.jmh:jmh-core:1.37'
     jmhAnnotationProcessor 'org.openjdk.jmh:jmh-generator-annprocess:1.37'
+    jmhImplementation 'com.google.guava:guava:33.2.1-jre'
+    jcstressImplementation 'org.openjdk.jcstress:jcstress-core:0.16'
+    jcstressAnnotationProcessor 'org.openjdk.jcstress:jcstress-core:0.16'
+}
+
+// jcstress requires JDK 11+ to run; compile and execute its source set on 17.
+compileJcstressJava {
+    javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(17) }
+    options.compilerArgs += ['-Xlint:-options']
+}
+
+tasks.register('jcstressRun', JavaExec) {
+    group = 'verification'
+    description = 'Runs jcstress concurrency tests (quick mode by default).'
+    dependsOn compileJcstressJava
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    classpath = sourceSets.jcstress.runtimeClasspath
+    mainClass = 'org.openjdk.jcstress.Main'
+    jvmArgs = ['-Xms256m', '-Xmx1g', '-XX:+UseSerialGC']
+    if (project.hasProperty('jcstressArgs')) {
+        args project.property('jcstressArgs').toString().split('\\s+')
+    } else {
+        // Quick-profile equivalent: 1 iteration per test, 1 fork, capped CPUs.
+        // "-af none" avoids taskset-based CPU pinning, which is unavailable on Windows.
+        args = ['-c', '2', '-f', '1', '-iters', '1', '-time', '200', '-af', 'NONE']
+    }
 }
 
 tasks.register('jmhRun', JavaExec) {

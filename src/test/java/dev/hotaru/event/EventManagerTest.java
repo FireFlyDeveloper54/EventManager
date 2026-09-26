@@ -3294,4 +3294,158 @@ class EventManagerTest {
         assertEquals(Arrays.asList("T1", "T2", "T3"), replayedTraces);
     }
 
+    @Test
+    void registeringUnrelatedTypeKeepsOtherCacheEntries() throws Exception {
+        EventManager bus = new EventManager();
+        bus.register(Ping.class, new Consumer<Ping>() {
+            @Override
+            public void accept(Ping event) {}
+        });
+        bus.dispatch(new Ping());
+
+        java.lang.reflect.Field cacheField = EventManager.class.getDeclaredField("dispatchCache");
+        cacheField.setAccessible(true);
+        java.util.concurrent.ConcurrentMap<?, ?> cache =
+                (java.util.concurrent.ConcurrentMap<?, ?>) cacheField.get(bus);
+        assertTrue(cache.containsKey(Ping.class), "dispatch cache should hold a warmed entry");
+
+        // Registering a handler for an unrelated event type must not evict the
+        // cached dispatch list of Ping (precise invalidation, not clear-all).
+        bus.register(Save.class, new Consumer<Save>() {
+            @Override
+            public void accept(Save event) {}
+        });
+        assertTrue(cache.containsKey(Ping.class),
+                "registering an unrelated event type evicted the cached dispatch entry");
+    }
+
+    @Test
+    void failedCompensationDoesNotBlockRemainingCompensations() {
+        EventManager bus = new EventManager();
+        final List<String> ran = new ArrayList<String>();
+        bus.transaction(new Consumer<TransactionContext>() {
+            @Override
+            public void accept(final TransactionContext tx) {
+                tx.onRollback(new Runnable() {
+                    @Override
+                    public void run() {
+                        ran.add("first");
+                    }
+                });
+                tx.onRollback(new Runnable() {
+                    @Override
+                    public void run() {
+                        ran.add("second");
+                        throw new IllegalStateException("compensation boom");
+                    }
+                });
+                tx.onRollback(new Runnable() {
+                    @Override
+                    public void run() {
+                        ran.add("third");
+                    }
+                });
+                tx.rollback();
+            }
+        });
+
+        // LIFO order, and the failure of "second" must not prevent "first".
+        assertEquals(Arrays.asList("third", "second", "first"), ran);
+    }
+
+    @Test
+    void failedCommitHookDoesNotBlockRemainingHooksOrAffectFlush() {
+        EventManager bus = new EventManager();
+        final List<String> hooks = new ArrayList<String>();
+        final List<Integer> received = new ArrayList<Integer>();
+        bus.register(BatchItemEvent.class, new Consumer<BatchItemEvent>() {
+            @Override
+            public void accept(BatchItemEvent event) {
+                received.add(event.getId());
+            }
+        });
+        bus.transaction(new Consumer<TransactionContext>() {
+            @Override
+            public void accept(final TransactionContext tx) {
+                tx.onCommit(new Runnable() {
+                    @Override
+                    public void run() {
+                        hooks.add("hook1");
+                        throw new IllegalStateException("hook boom");
+                    }
+                });
+                tx.onCommit(new Runnable() {
+                    @Override
+                    public void run() {
+                        hooks.add("hook2");
+                    }
+                });
+                bus.dispatch(new BatchItemEvent(7));
+            }
+        });
+
+        assertEquals(Arrays.asList(7), received);
+        assertEquals(Arrays.asList("hook1", "hook2"), hooks);
+    }
+
+    @Test
+    void debounceFlushFailureIsRoutedToErrorHandler() throws Exception {
+        final List<Throwable> failures = Collections.synchronizedList(new ArrayList<Throwable>());
+        final List<Event> failedEvents = Collections.synchronizedList(new ArrayList<Event>());
+        EventManager bus = new EventManager(new EventErrorHandler() {
+            @Override
+            public void handle(Event event, Object listener, Throwable throwable) {
+                failures.add(throwable);
+                failedEvents.add(event);
+            }
+        });
+
+        // The debounced handler runs on the shared scheduler thread, outside
+        // any dispatch stack. Without routing, the failure would silently die
+        // inside the ignored ScheduledFuture.
+        bus.on(Ping.class).debounce(20, TimeUnit.MILLISECONDS).handle(new Consumer<Ping>() {
+            @Override
+            public void accept(Ping event) {
+                throw new IllegalStateException("debounced boom");
+            }
+        });
+        bus.dispatch(new Ping());
+
+        long deadline = System.currentTimeMillis() + 2000;
+        while (failures.isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        assertEquals(1, failures.size());
+        assertTrue(failures.get(0) instanceof IllegalStateException);
+        assertTrue(failedEvents.get(0) instanceof Ping);
+    }
+
+    @Test
+    void batchFlushFailureIsRoutedToErrorHandler() {
+        final List<Throwable> failures = Collections.synchronizedList(new ArrayList<Throwable>());
+        final List<Event> failedEvents = Collections.synchronizedList(new ArrayList<Event>());
+        EventManager bus = new EventManager(new EventErrorHandler() {
+            @Override
+            public void handle(Event event, Object listener, Throwable throwable) {
+                failures.add(throwable);
+                failedEvents.add(event);
+            }
+        });
+
+        bus.on(BatchItemEvent.class).buffer(2, 50, TimeUnit.MILLISECONDS).handleBatch(new Consumer<List<BatchItemEvent>>() {
+            @Override
+            public void accept(List<BatchItemEvent> batch) {
+                throw new IllegalStateException("batch boom");
+            }
+        });
+
+        // Size-triggered flush runs synchronously inside the second dispatch.
+        bus.dispatch(new BatchItemEvent(1));
+        bus.dispatch(new BatchItemEvent(2));
+
+        assertEquals(1, failures.size());
+        assertTrue(failures.get(0) instanceof IllegalStateException);
+        assertTrue(failedEvents.get(0) instanceof BatchItemEvent);
+    }
+
 }

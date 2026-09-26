@@ -416,6 +416,57 @@ EventManager mockBus = new EventManager();
 session.replayTo(mockBus); // 完全无损重现当时的事件链路与上下文！
 ```
 
+## 架构与代码布局
+
+核心包 `dev.hotaru.event` 按职责拆分为协作的包内实现类（对使用者不可见，公共 API 仍集中在 `EventManager`）：
+
+| 文件 | 职责 |
+|---|---|
+| `EventManager.java` | 总线门面：注册表、分发快照、订阅生命周期、粘性事件、指标、子总线 |
+| `ListenerIntrospection.java` | 监听器内省：`@EventTarget` 扫描、`LambdaMetafactory` Invoker 工厂、字段访问器、泛型事件类型解析（进程级 `ClassValue` 缓存） |
+| `HandlerOrdering.java` | 派发顺序：优先级/注册序排序 + Kahn 拓扑排序（DAG 依赖）与循环依赖检测 |
+| `EventTransactions.java` | 线程隔离事务：事件缓冲、提交刷出、Saga LIFO 补偿 |
+| `EventExpectations.java` | `expect(...)` 异步等待器与超时控制 |
+| `TimeoutScheduler.java` | 共享守护调度线程（超时/防抖/批量刷出，只跑框架回调不跑用户代码） |
+| `SubscriberBuilder.java` | 流式订阅 DSL（节流/防抖/采样/熔断/微批/重试） |
+| `CircuitBreaker.java`、`AsyncEventChannel.java`、`EventRecorder.java`、`TopologyExporter.java` 等 | 独立组件 |
+
+## 并发正确性验证（jcstress）
+
+并发相关的核心不变量不由"测试碰巧通过"背书，而是用 OpenJDK 官方并发测试框架 [jcstress](https://github.com/openjdk/jcstress) 在真实多线程交错下验证（源码见 `src/jcstress`）：
+
+| 测试 | 验证的不变量 |
+|---|---|
+| `SameListenerRegistrationRace` | 两线程并发注册同一注解监听器实例：CAS 插入循环内的 Handler-equals 去重必须吸收竞态，最终恰好 1 个 handler |
+| `RegistrationVsDispatchRace` | 注册与分发并发交错：已注册的 handler 对每次分发**恰好**收到一次（永不重复、永不丢失），赢得竞态快照的最多两次、否则一次 |
+| `ChurnVsDispatchRace` | 一线程循环注册/注销、另一线程连续分发 10 次：构造期注册的稳定监听器**每次分发恰好收到一次**，无 CME/NPE 泄漏（并发缓存失效不破坏快照读取） |
+
+```bash
+./gradlew jcstressRun                # quick profile（CI 默认）
+./gradlew jcstressRun -PjcstressArgs="-iters 5 -time 1000"   # 更高置信度
+```
+
+jcstress 在 JDK 17 上运行（框架要求），被测代码仍是 Java 8 字节码；CI 中为独立 job。
+
+## 与 Guava EventBus 对比
+
+`VersusGuavaBenchmark` 在相同负载下与 Guava `EventBus` 同机对比（单监听器 / 十监听器两组）。运行方式：
+
+```bash
+./gradlew jmhRun -PjmhArgs="VersusGuavaBenchmark.* -f 1 -wi 3 -i 5"
+```
+
+这不是严格的跨库性能研究（单机、默认配置、小监听器规模），只是让性能宣称可复现。发布前请在目标硬件上以 `-f 3 -wi 5 -i 10` 完整运行后再引用数字。
+
+本机参考值（avgt，5 轮取均值，仅示意量级勿直接引用）：
+
+| 场景 | EventManager | Guava EventBus |
+|---|---|---|
+| 单监听器派发 | ~115 ns/op | ~115 ns/op（基本持平） |
+| 10 监听器派发 | ~227 ns/op | ~437 ns/op（约 1.9×） |
+
+结论并非"全面碾压"：单监听器稳态两者打平；监听器数量增多时本库的 LambdaMetafactory 直调路径边际成本更低。差异是否重要取决于业务场景，请自行实测。
+
 ## 构建 / 测试 / 基准测试
 
 ```bash

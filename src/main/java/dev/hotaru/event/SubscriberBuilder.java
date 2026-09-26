@@ -23,9 +23,6 @@ import java.util.function.Predicate;
  */
 public final class SubscriberBuilder<T extends Event> {
 
-    private static final java.util.logging.Logger LOGGER =
-            java.util.logging.Logger.getLogger(SubscriberBuilder.class.getName());
-
     private final EventManager bus;
     private final Class<T> eventType;
     private int priority = Priority.NORMAL;
@@ -220,9 +217,6 @@ public final class SubscriberBuilder<T extends Event> {
     }
 
     /**
-     * Terminal operation: registers a {@link Consumer} action and returns the active subscription.
-     */
-        /**
      * Assigns a unique identifier to this subscriber for DAG dependency references.
      */
     public SubscriberBuilder<T> id(String id) {
@@ -286,7 +280,7 @@ public final class SubscriberBuilder<T extends Event> {
         return this;
     }
 
-        /**
+    /**
      * Configures sliding-window micro-batching. Events will be collected and delivered as a batch
      * once {@code maxBatchSize} is reached or {@code timeout} elapses.
      *
@@ -353,7 +347,11 @@ public final class SubscriberBuilder<T extends Event> {
                     try {
                         batchAction.accept(toDispatch);
                     } catch (Throwable t) {
-                        LOGGER.log(java.util.logging.Level.WARNING, "Batch handler failed for " + eventType.getName(), t);
+                        // Runs on the scheduler thread (or during unsubscribe) —
+                        // outside any dispatch stack, so route to the bus's
+                        // pluggable error handler instead of letting the
+                        // exception die inside the ScheduledFuture.
+                        EventManager.notifyHandlerFailure(bus, toDispatch.get(0), batchAction, t);
                     }
                 }
             }
@@ -382,7 +380,7 @@ public final class SubscriberBuilder<T extends Event> {
                     try {
                         batchAction.accept(toDispatch);
                     } catch (Throwable t) {
-                        LOGGER.log(java.util.logging.Level.WARNING, "Batch handler failed for " + eventType.getName(), t);
+                        EventManager.notifyHandlerFailure(bus, toDispatch.get(0), batchAction, t);
                     }
                 }
             }
@@ -513,7 +511,15 @@ public final class SubscriberBuilder<T extends Event> {
                     ScheduledFuture<?> nextTask = EventManager.getTimeoutScheduler().schedule(new Runnable() {
                         @Override
                         public void run() {
-                            prev.accept(event);
+                            try {
+                                prev.accept(event);
+                            } catch (Throwable t) {
+                                // The handler runs on the shared scheduler
+                                // thread, outside any dispatch stack: without
+                                // this routing the exception would vanish
+                                // inside the ignored ScheduledFuture.
+                                EventManager.notifyHandlerFailure(bus, event, prev, t);
+                            }
                         }
                     }, delay, unit);
                     debounceTask.set(nextTask);
