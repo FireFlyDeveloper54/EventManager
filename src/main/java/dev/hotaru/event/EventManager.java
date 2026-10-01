@@ -14,9 +14,11 @@ import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
 import java.util.ArrayList;
 import java.lang.ref.WeakReference;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
@@ -1010,7 +1012,7 @@ public class EventManager implements AutoCloseable {
         boolean hadRegistrations = !eventHandlers.isEmpty() || !dispatchCache.isEmpty();
         for (Handler[] handlers : eventHandlers.values()) {
             for (Handler handler : handlers) {
-                handler.active = false;
+                handler.active.set(false);
             }
         }
         eventHandlers.clear();
@@ -1027,7 +1029,7 @@ public class EventManager implements AutoCloseable {
         Handler[] removed = eventHandlers.remove(eventType);
         if (removed != null) {
             for (Handler handler : removed) {
-                handler.active = false;
+                handler.active.set(false);
             }
             invalidateDispatchCache(eventType);
         }
@@ -1043,7 +1045,7 @@ public class EventManager implements AutoCloseable {
         for (Handler[] handlers : eventHandlers.values()) {
             for (int i = 0; i < handlers.length; i++) {
                 Handler handler = handlers[i];
-                if (handler.active && !handler.isDead() && handler.matchesListener(listener)) {
+                if (handler.active.get() && !handler.isDead() && handler.matchesListener(listener)) {
                     return true;
                 }
             }
@@ -1063,7 +1065,7 @@ public class EventManager implements AutoCloseable {
             Class<?> listenerClass = (Class<?>) listener;
             for (int i = 0; i < handlers.length; i++) {
                 Handler handler = handlers[i];
-                if (handler.active && !handler.isDead()
+                if (handler.active.get() && !handler.isDead()
                         && (handler.listener == listenerClass
                         || listenerClass.isAssignableFrom(listenerClassOf(handler.listener)))) {
                     return true;
@@ -1073,7 +1075,7 @@ public class EventManager implements AutoCloseable {
         }
         for (int i = 0; i < handlers.length; i++) {
             Handler handler = handlers[i];
-            if (handler.active && !handler.isDead() && handler.matchesListener(listener)) {
+            if (handler.active.get() && !handler.isDead() && handler.matchesListener(listener)) {
                 return true;
             }
         }
@@ -1087,7 +1089,7 @@ public class EventManager implements AutoCloseable {
         for (Handler[] handlers : eventHandlers.values()) {
             for (int i = 0; i < handlers.length; i++) {
                 Handler handler = handlers[i];
-                if (handler.active && !handler.isDead()
+                if (handler.active.get() && !handler.isDead()
                         && (handler.listener == listenerClass
                         || listenerClass.isAssignableFrom(listenerClassOf(handler.listener)))) {
                     return true;
@@ -1102,7 +1104,7 @@ public class EventManager implements AutoCloseable {
         for (Handler[] handlers : eventHandlers.values()) {
             for (int i = 0; i < handlers.length; i++) {
                 Handler handler = handlers[i];
-                if (handler.active && !handler.isDead()) {
+                if (handler.active.get() && !handler.isDead()) {
                     listeners.add(handler.getListener());
                 }
             }
@@ -1115,7 +1117,7 @@ public class EventManager implements AutoCloseable {
         for (Handler[] handlers : eventHandlers.values()) {
             for (int i = 0; i < handlers.length; i++) {
                 Handler handler = handlers[i];
-                if (handler.active && !handler.isDead()) {
+                if (handler.active.get() && !handler.isDead()) {
                     count++;
                 }
             }
@@ -1151,7 +1153,7 @@ public class EventManager implements AutoCloseable {
         Handler[] handlers = handlersFor(eventType);
         for (int i = 0; i < handlers.length; i++) {
             Handler handler = handlers[i];
-            if (handler.active && !handler.isDead()) {
+            if (handler.active.get() && !handler.isDead()) {
                 return true;
             }
         }
@@ -1165,7 +1167,7 @@ public class EventManager implements AutoCloseable {
         Handler[] handlers = exactHandlersFor(eventType);
         for (int i = 0; i < handlers.length; i++) {
             Handler handler = handlers[i];
-            if (handler.active && !handler.isDead()) {
+            if (handler.active.get() && !handler.isDead()) {
                 return true;
             }
         }
@@ -1214,18 +1216,10 @@ public class EventManager implements AutoCloseable {
             if (metricsEnabled) {
                 recordDuration(event.getClass(), System.nanoTime() - startNanos);
             }
-            if (upcasterList != null && !upcasterList.isEmpty()) {
-                for (EventUpcaster.Typed<?, ?> upcaster : upcasterList) {
-                    @SuppressWarnings("unchecked")
-                    EventUpcaster.Typed<Object, Object> typed = (EventUpcaster.Typed<Object, Object>) upcaster;
-                    Object upcasted = typed.upcast(event);
-                    if (upcasted instanceof Event) {
-                        dispatch((Event) upcasted);
-                    }
-                }
-            } else if (parent != null) {
+            applyUpcasters(event, upcasterList);
+            if (canBubbleToParent(event)) {
                 parent.dispatch(event);
-            } else if (deadEventsEnabled && !(event instanceof DeadEvent) && hasListeners(DeadEvent.class)) {
+            } else if (parent == null && deadEventsEnabled && !(event instanceof DeadEvent) && hasListeners(DeadEvent.class)) {
                 dispatch(new DeadEvent(this, event, EventTrace.capture()));
             }
             return event;
@@ -1239,31 +1233,48 @@ public class EventManager implements AutoCloseable {
             }
         }
 
-        if (upcasterList != null && !upcasterList.isEmpty()) {
-            for (EventUpcaster.Typed<?, ?> upcaster : upcasterList) {
-                @SuppressWarnings("unchecked")
-                EventUpcaster.Typed<Object, Object> typed = (EventUpcaster.Typed<Object, Object>) upcaster;
-                Object upcasted = typed.upcast(event);
-                if (upcasted instanceof Event) {
-                    dispatch((Event) upcasted);
-                }
-            }
-        }
-
-        if (parent != null) {
-            boolean canBubble = true;
-            if (event instanceof Cancellable && ((Cancellable) event).isCancelled()) {
-                canBubble = false;
-            }
-            if (event instanceof Stoppable && ((Stoppable) event).isStopped()) {
-                canBubble = false;
-            }
-            if (canBubble) {
-                parent.dispatch(event);
-            }
+        applyUpcasters(event, upcasterList);
+        if (canBubbleToParent(event)) {
+            parent.dispatch(event);
         }
 
         return event;
+    }
+
+    /**
+     * Applies the registered upcasters for the event's runtime type, dispatching
+     * each converted event. Extracted so the empty-handler and normal dispatch
+     * paths share identical upcaster semantics.
+     */
+    private void applyUpcasters(Event event, List<EventUpcaster.Typed<?, ?>> upcasterList) {
+        if (upcasterList == null || upcasterList.isEmpty()) {
+            return;
+        }
+        for (EventUpcaster.Typed<?, ?> upcaster : upcasterList) {
+            @SuppressWarnings("unchecked")
+            EventUpcaster.Typed<Object, Object> typed = (EventUpcaster.Typed<Object, Object>) upcaster;
+            Object upcasted = typed.upcast(event);
+            if (upcasted instanceof Event) {
+                dispatch((Event) upcasted);
+            }
+        }
+    }
+
+    /**
+     * Returns whether the event may bubble to the parent bus: a parent must
+     * exist and the event must not have been cancelled or stopped.
+     */
+    private boolean canBubbleToParent(Event event) {
+        if (parent == null) {
+            return false;
+        }
+        if (event instanceof Cancellable && ((Cancellable) event).isCancelled()) {
+            return false;
+        }
+        if (event instanceof Stoppable && ((Stoppable) event).isStopped()) {
+            return false;
+        }
+        return true;
     }
 
     public <T extends Event> T dispatch(T event, Runnable afterDispatch) {
@@ -1542,7 +1553,7 @@ public class EventManager implements AutoCloseable {
             Handler handler = handlers[i];
 
             // A dispatch snapshot may outlive a concurrent unregister/clear.
-            if (!handler.active) {
+            if (!handler.active.get()) {
                 continue;
             }
 
@@ -1605,7 +1616,11 @@ public class EventManager implements AutoCloseable {
 
             try {
                 if (handler.once) {
-                    handler.active = false;
+                    // Claim the single execution right atomically: concurrent
+                    // dispatches sharing this snapshot must not double-fire.
+                    if (!handler.active.compareAndSet(true, false)) {
+                        continue;
+                    }
                     removeHandlers(handler.eventType, new Predicate<Handler>() {
                         @Override
                         public boolean test(Handler candidate) {
@@ -2145,7 +2160,7 @@ public class EventManager implements AutoCloseable {
     private static void markInactive(Handler[] handlers, Predicate<Handler> predicate) {
         for (int i = 0; i < handlers.length; i++) {
             if (predicate.test(handlers[i])) {
-                handlers[i].active = false;
+                handlers[i].active.set(false);
             }
         }
     }
@@ -2241,7 +2256,7 @@ public class EventManager implements AutoCloseable {
             if (!subscribed.compareAndSet(true, false)) {
                 return;
             }
-            handler.active = false;
+            handler.active.set(false);
             removeHandlers(handler.eventType, new Predicate<Handler>() {
                 @Override
                 public boolean test(Handler candidate) {
@@ -2252,11 +2267,11 @@ public class EventManager implements AutoCloseable {
 
         @Override
         public boolean isSubscribed() {
-            if (!subscribed.get() || !handler.active) {
+            if (!subscribed.get() || !handler.active.get()) {
                 return false;
             }
             if (handler.weakListener != null && handler.weakListener.get() == null) {
-                handler.active = false;
+                handler.active.set(false);
                 return false;
             }
             Handler[] handlers = eventHandlers.get(handler.eventType);
@@ -2302,11 +2317,11 @@ public class EventManager implements AutoCloseable {
                 return false;
             }
             for (Handler handler : handlers) {
-                if (!handler.active) {
+                if (!handler.active.get()) {
                     continue;
                 }
                 if (handler.weakListener != null && handler.weakListener.get() == null) {
-                    handler.active = false;
+                    handler.active.set(false);
                     continue;
                 }
                 Handler[] current = eventHandlers.get(handler.eventType);
@@ -2350,7 +2365,7 @@ public class EventManager implements AutoCloseable {
         final String[] before;
         final Class<?>[] afterClasses;
         final Class<?>[] beforeClasses;
-        private volatile boolean active = true;
+        private final AtomicBoolean active = new AtomicBoolean(true);
 
         private Handler(Object listener, boolean weak, Method method, Field field, Object dedupeOwner,
                         Class<? extends Event> eventType, int priority, boolean ignoreCancelled,
@@ -2460,7 +2475,7 @@ public class EventManager implements AutoCloseable {
             if (weakListener != null) {
                 Object target = weakListener.get();
                 if (target == null) {
-                    active = false;
+                    active.set(false);
                     return false;
                 }
                 if (target instanceof EventSubscriber) {
@@ -2879,9 +2894,25 @@ public class EventManager implements AutoCloseable {
         if (event == null) {
             return null;
         }
+        EventTransactions.EventTransaction tx = EventTransactions.current();
+        if (tx != null) {
+            // Buffer the sticky write together with the dispatch: on rollback
+            // the sticky cache must not retain an event that never happened.
+            tx.buffer.add(new EventTransactions.BufferedEvent(event, false, true));
+            return event;
+        }
+        writeSticky(event);
+        return dispatch(event);
+    }
+
+    /**
+     * Writes the sticky cache entry for the event's runtime type (including the
+     * upcaster cascade) without dispatching it. Package-private so the
+     * transaction machinery can replay it at commit time.
+     */
+    void writeSticky(Event event) {
         stickyEvents.put(event.getClass(), event);
         cascadeStickyUpcasting(event);
-        return dispatch(event);
     }
 
     private void cascadeStickyUpcasting(Event event) {
@@ -2909,16 +2940,52 @@ public class EventManager implements AutoCloseable {
      */
     public <S, T> void registerUpcaster(EventUpcaster.Typed<S, T> upcaster) {
         Objects.requireNonNull(upcaster, "upcaster");
-        List<EventUpcaster.Typed<?, ?>> list = upcasters.get(upcaster.getSourceType());
+        Class<?> source = upcaster.getSourceType();
+        Class<?> target = upcaster.getTargetType();
+        if (source != null && target != null && reachesUpcasterTarget(target, source)) {
+            throw new IllegalArgumentException("Registering upcaster " + source.getName()
+                    + " -> " + target.getName() + " would create an upcaster cycle");
+        }
+        List<EventUpcaster.Typed<?, ?>> list = upcasters.get(source);
         if (list == null) {
             list = new CopyOnWriteArrayList<EventUpcaster.Typed<?, ?>>();
-            List<EventUpcaster.Typed<?, ?>> existing = upcasters.putIfAbsent(upcaster.getSourceType(), list);
+            List<EventUpcaster.Typed<?, ?>> existing = upcasters.putIfAbsent(source, list);
             if (existing != null) {
                 list = existing;
             }
         }
         list.add(upcaster);
         hasUpcasters = true;
+    }
+
+    /**
+     * Returns whether {@code from} can reach {@code to} by following registered
+     * upcaster edges (source -&gt; target). Used to reject registrations that
+     * would create a conversion cycle and recurse forever at dispatch time.
+     */
+    private boolean reachesUpcasterTarget(Class<?> from, Class<?> to) {
+        Set<Class<?>> visited = new HashSet<Class<?>>();
+        Deque<Class<?>> stack = new ArrayDeque<Class<?>>();
+        stack.push(from);
+        while (!stack.isEmpty()) {
+            Class<?> current = stack.pop();
+            if (current.equals(to)) {
+                return true;
+            }
+            if (!visited.add(current)) {
+                continue;
+            }
+            List<EventUpcaster.Typed<?, ?>> outgoing = upcasters.get(current);
+            if (outgoing != null) {
+                for (EventUpcaster.Typed<?, ?> u : outgoing) {
+                    Class<?> next = u.getTargetType();
+                    if (next != null) {
+                        stack.push(next);
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /**
