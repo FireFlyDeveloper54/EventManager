@@ -1,6 +1,5 @@
 package dev.hotaru.event;
 
-import dev.hotaru.event.impl.Event;
 
 /**
  * Allows a listener object to dynamically enable or disable its event handling

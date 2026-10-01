@@ -1,6 +1,5 @@
 package dev.hotaru.event;
 
-import dev.hotaru.event.impl.Event;
 import org.junit.jupiter.api.Test;
 
 import java.lang.ref.WeakReference;

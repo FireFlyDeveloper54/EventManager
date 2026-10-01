@@ -1,15 +1,10 @@
 package dev.hotaru.event.impl;
 
-public abstract class StoppableEvent implements Event, Stoppable {
-    private boolean stopped;
+/**
+ * @deprecated Moved to {@link dev.hotaru.event.StoppableEvent}. This class
+ * now extends it and remains only for source and binary compatibility.
+ */
+@Deprecated
+public abstract class StoppableEvent extends dev.hotaru.event.StoppableEvent {
 
-    @Override
-    public boolean isStopped() {
-        return stopped;
-    }
-
-    @Override
-    public void setStopped(boolean stopped) {
-        this.stopped = stopped;
-    }
 }
