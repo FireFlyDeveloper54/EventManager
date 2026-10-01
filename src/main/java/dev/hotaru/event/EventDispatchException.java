@@ -1,6 +1,5 @@
 package dev.hotaru.event;
 
-import dev.hotaru.event.impl.Event;
 
 /**
  * Wraps a checked throwable when {@link ErrorPolicy#PROPAGATE} is selected.

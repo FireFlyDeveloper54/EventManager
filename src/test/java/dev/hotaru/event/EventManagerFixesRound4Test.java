@@ -1,6 +1,5 @@
 package dev.hotaru.event;
 
-import dev.hotaru.event.impl.Event;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.ConcurrentMap;
@@ -25,9 +24,9 @@ public class EventManagerFixesRound4Test {
 
     @SuppressWarnings("unchecked")
     private static ConcurrentMap<Class<?>, ?> dispatchCacheOf(EventManager bus) throws Exception {
-        java.lang.reflect.Field f = EventManager.class.getDeclaredField("dispatchCache");
+        java.lang.reflect.Field f = HandlerRegistry.class.getDeclaredField("dispatchCache");
         f.setAccessible(true);
-        return (ConcurrentMap<Class<?>, ?>) f.get(bus);
+        return (ConcurrentMap<Class<?>, ?>) f.get(bus.handlerRegistry);
     }
 
     @Test

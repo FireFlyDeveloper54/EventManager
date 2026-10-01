@@ -1,15 +1,10 @@
 package dev.hotaru.event.impl;
 
-public interface Cancellable {
-    boolean isCancelled();
+/**
+ * @deprecated Moved to {@link dev.hotaru.event.Cancellable}. This interface
+ * now extends it and remains only for source and binary compatibility.
+ */
+@Deprecated
+public interface Cancellable extends dev.hotaru.event.Cancellable {
 
-    void setCancelled(boolean state);
-
-    default void cancel() {
-        setCancelled(true);
-    }
-
-    default void uncancel() {
-        setCancelled(false);
-    }
 }
