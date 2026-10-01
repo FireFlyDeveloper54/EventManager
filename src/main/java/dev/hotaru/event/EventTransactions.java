@@ -61,11 +61,27 @@ final class EventTransactions {
                     List<BufferedEvent> toFlush = new ArrayList<BufferedEvent>(tx.buffer);
                     tx.buffer.clear();
                     HOLDER.remove();
+                    // Flush every buffered event even if one of them fails:
+                    // a single broken dispatch must not silently drop the rest.
+                    // Errors are recorded (never swallowed) and rethrown after
+                    // the commit hooks have run.
+                    Throwable flushError = null;
                     for (BufferedEvent be : toFlush) {
-                        if (be.exact) {
-                            bus.dispatchExact(be.event);
-                        } else {
-                            bus.dispatch(be.event);
+                        try {
+                            if (be.sticky) {
+                                bus.writeSticky(be.event);
+                            }
+                            if (be.exact) {
+                                bus.dispatchExact(be.event);
+                            } else {
+                                bus.dispatch(be.event);
+                            }
+                        } catch (Throwable t) {
+                            if (flushError == null) {
+                                flushError = t;
+                            } else {
+                                flushError.addSuppressed(t);
+                            }
                         }
                     }
                     for (Runnable commitHook : tx.commitHooks) {
@@ -74,6 +90,15 @@ final class EventTransactions {
                         } catch (Throwable t) {
                             log.log(Level.WARNING, "Transaction commit hook failed", t);
                         }
+                    }
+                    if (flushError != null) {
+                        if (flushError instanceof RuntimeException) {
+                            throw (RuntimeException) flushError;
+                        }
+                        if (flushError instanceof Error) {
+                            throw (Error) flushError;
+                        }
+                        throw new RuntimeException("Transaction flush failed", flushError);
                     }
                 } else {
                     tx.buffer.clear();
@@ -129,10 +154,16 @@ final class EventTransactions {
     static final class BufferedEvent {
         final Event event;
         final boolean exact;
+        final boolean sticky;
 
         BufferedEvent(Event event, boolean exact) {
+            this(event, exact, false);
+        }
+
+        BufferedEvent(Event event, boolean exact, boolean sticky) {
             this.event = event;
             this.exact = exact;
+            this.sticky = sticky;
         }
     }
 
