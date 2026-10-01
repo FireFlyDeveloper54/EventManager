@@ -1095,8 +1095,10 @@ public class EventManager implements AutoCloseable {
             for (Handler handler : removed) {
                 handler.active.set(false);
             }
-            invalidateDispatchCache(eventType);
         }
+        // Always invalidate: dispatch warms dispatchCache even with no handler,
+        // and the entry keeps a strong ref to the event Class, blocking unload.
+        invalidateDispatchCache(eventType);
     }
 
     public boolean isRegistered(Object listener) {
@@ -1569,10 +1571,26 @@ public class EventManager implements AutoCloseable {
 
         @Override
         public void run() {
-            this.executed = true;
-            EventManager targetBus = this.bus;
+            final EventManager targetBus;
+            final Event targetEvent;
+            final Handler[] targetHandlers;
+            synchronized (this) {
+                if (executed) {
+                    throw new IllegalStateException("proceed() must be called at most once per dispatch");
+                }
+                executed = true;
+                // Detach under release()'s monitor so a racing release()
+                // can't null fields mid-read: async proceed() neither loses
+                // the event nor dispatches half-nulled state.
+                targetBus = this.bus;
+                targetEvent = this.event;
+                targetHandlers = this.handlers;
+                this.bus = null;
+                this.event = null;
+                this.handlers = null;
+            }
             if (targetBus != null) {
-                targetBus.doDispatch(event, handlers);
+                targetBus.doDispatch(targetEvent, targetHandlers);
             }
         }
     }
@@ -1593,9 +1611,11 @@ public class EventManager implements AutoCloseable {
         }
 
         private void release(DispatchFrame frame) {
-            frame.clear();
-            frame.next = head;
-            head = frame;
+            synchronized (frame) {
+                frame.clear();
+                frame.next = head;
+                head = frame;
+            }
         }
     }
 
