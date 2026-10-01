@@ -64,7 +64,10 @@ final class EventTransactions {
                     // Flush every buffered event even if one of them fails:
                     // a single broken dispatch must not silently drop the rest.
                     // Errors are recorded (never swallowed) and rethrown after
-                    // the commit hooks have run.
+                    // the commit hooks have run. If the bus was closed while the
+                    // transaction was in flight, each dispatch throws
+                    // IllegalStateException and is collected like any other
+                    // flush failure (hooks still run, first error rethrown).
                     Throwable flushError = null;
                     for (BufferedEvent be : toFlush) {
                         try {
