@@ -187,8 +187,9 @@ public final class AsyncEventChannel<T extends Event> implements AutoCloseable {
         @Override
         public void run() {
             while (!closed.get() || !queue.isEmpty()) {
+                T event = null;
                 try {
-                    T event = queue.poll(100, TimeUnit.MILLISECONDS);
+                    event = queue.poll(100, TimeUnit.MILLISECONDS);
                     if (event != null) {
                         try {
                             bus.dispatch(event);
@@ -202,7 +203,10 @@ public final class AsyncEventChannel<T extends Event> implements AutoCloseable {
                         break;
                     }
                 } catch (Throwable t) {
-                    // prevent worker thread death from unhandled dispatch exceptions
+                    // The worker must never die silently: route the escape to
+                    // the bus error handler. reportAsyncFailure never throws
+                    // and never propagates, so the loop always continues.
+                    bus.reportAsyncFailure(event, t);
                 }
             }
         }
