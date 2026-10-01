@@ -1,10 +1,6 @@
 package dev.hotaru.event;
 
 import dev.hotaru.event.annotations.EventTarget;
-import dev.hotaru.event.impl.CancellableEvent;
-import dev.hotaru.event.impl.CancellableStoppableEvent;
-import dev.hotaru.event.impl.Event;
-import dev.hotaru.event.impl.StoppableEvent;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
@@ -1646,7 +1642,7 @@ class EventManagerTest {
     // Feature 1: Reified Generic Event Dispatching Tests
     // =========================================================================
 
-    public static class GenericPayloadEvent<T> extends dev.hotaru.event.impl.AbstractGenericEvent<T> {
+    public static class GenericPayloadEvent<T> extends AbstractGenericEvent<T> {
         private final T payload;
 
         public GenericPayloadEvent(T payload, java.lang.reflect.Type genericType) {
@@ -3157,10 +3153,10 @@ class EventManagerTest {
         });
         bus.dispatch(new Ping());
 
-        java.lang.reflect.Field cacheField = EventManager.class.getDeclaredField("dispatchCache");
+        java.lang.reflect.Field cacheField = HandlerRegistry.class.getDeclaredField("dispatchCache");
         cacheField.setAccessible(true);
         java.util.concurrent.ConcurrentMap<?, ?> cache =
-                (java.util.concurrent.ConcurrentMap<?, ?>) cacheField.get(bus);
+                (java.util.concurrent.ConcurrentMap<?, ?>) cacheField.get(bus.handlerRegistry);
         assertTrue(cache.containsKey(Ping.class), "dispatch cache should hold a warmed entry");
 
         // Registering a handler for an unrelated event type must not evict the
