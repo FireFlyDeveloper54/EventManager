@@ -1,15 +1,10 @@
 package dev.hotaru.event.impl;
 
-public abstract class CancellableEvent implements Event, Cancellable {
-    private boolean cancelled;
+/**
+ * @deprecated Moved to {@link dev.hotaru.event.CancellableEvent}. This class
+ * now extends it and remains only for source and binary compatibility.
+ */
+@Deprecated
+public abstract class CancellableEvent extends dev.hotaru.event.CancellableEvent {
 
-    @Override
-    public boolean isCancelled() {
-        return cancelled;
-    }
-
-    @Override
-    public void setCancelled(boolean cancelled) {
-        this.cancelled = cancelled;
-    }
 }

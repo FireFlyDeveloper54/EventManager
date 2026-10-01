@@ -1,6 +1,5 @@
 package dev.hotaru.event;
 
-import dev.hotaru.event.impl.Event;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;

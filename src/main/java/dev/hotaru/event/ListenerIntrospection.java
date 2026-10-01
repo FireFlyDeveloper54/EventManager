@@ -1,7 +1,6 @@
 package dev.hotaru.event;
 
 import dev.hotaru.event.annotations.EventTarget;
-import dev.hotaru.event.impl.Event;
 
 import java.lang.invoke.LambdaMetafactory;
 import java.lang.invoke.MethodHandle;
