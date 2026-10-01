@@ -9,8 +9,6 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * A lock-free, zero-allocation circuit breaker protecting the event bus from repeatedly failing
  * or runaway event listeners.
- * <p>
- * Employs cache-line padding to mitigate hardware-level False Sharing on multi-core processors.
  *
  * <p>State transitions:
  * <ul>
@@ -27,21 +25,17 @@ public final class CircuitBreaker {
         HALF_OPEN
     }
 
-    // Cache-line padding to prevent false sharing
-    long p01, p02, p03, p04, p05, p06, p07;
-
     private final int maxFailures;
     private final long cooldownNanos;
 
-    long p11, p12, p13, p14, p15, p16, p17;
-
+    // Note: the mutable state below lives inside the Atomic* holder objects,
+    // not in this object's fields, so manual cache-line padding around the
+    // references here would not isolate the actual hot fields. The hot path
+    // (allowExecution) is a single volatile read; failure recording is rare
+    // by design, so no padding is applied.
     private final AtomicInteger failureCount = new AtomicInteger();
 
-    long p21, p22, p23, p24, p25, p26, p27;
-
     private final AtomicLong lastFailureNanos = new AtomicLong();
-
-    long p31, p32, p33, p34, p35, p36, p37;
 
     private volatile State state = State.CLOSED;
 
