@@ -13,6 +13,12 @@ public interface EventInterceptor {
 
     /**
      * Intercepts the dispatch of an event.
+     * <p>
+     * The {@code proceed} callback must be invoked <b>at most once</b>; invoking
+     * it a second time throws {@link IllegalStateException}. It should be invoked
+     * synchronously before this method returns: retaining the callback and
+     * invoking it afterwards is not supported and may interact badly with the
+     * internal frame pooling.
      *
      * @param event   The event currently being dispatched.
      * @param proceed A callback to continue the standard downstream dispatch to listeners.
