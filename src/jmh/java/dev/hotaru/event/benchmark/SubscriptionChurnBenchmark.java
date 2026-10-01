@@ -2,7 +2,7 @@ package dev.hotaru.event.benchmark;
 
 import dev.hotaru.event.EventManager;
 import dev.hotaru.event.Subscription;
-import dev.hotaru.event.impl.Event;
+import dev.hotaru.event.Event;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;

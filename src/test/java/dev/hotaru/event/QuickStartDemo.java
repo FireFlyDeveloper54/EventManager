@@ -1,8 +1,6 @@
 package dev.hotaru.event;
 
 import dev.hotaru.event.annotations.EventTarget;
-import dev.hotaru.event.impl.CancellableEvent;
-import dev.hotaru.event.impl.Event;
 
 import java.util.concurrent.TimeUnit;
 

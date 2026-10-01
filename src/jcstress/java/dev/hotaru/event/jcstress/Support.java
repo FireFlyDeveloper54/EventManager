@@ -1,7 +1,7 @@
 package dev.hotaru.event.jcstress;
 
 import dev.hotaru.event.annotations.EventTarget;
-import dev.hotaru.event.impl.Event;
+import dev.hotaru.event.Event;
 
 public final class Support {
     public static final class Ping implements Event {}
