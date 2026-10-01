@@ -1,6 +1,5 @@
 package dev.hotaru.event;
 
-import dev.hotaru.event.impl.Event;
 
 /**
  * Functional interface for intercepting event dispatches across the event bus.

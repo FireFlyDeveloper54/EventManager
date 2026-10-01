@@ -12,9 +12,9 @@ import java.util.List;
  */
 final class HandlerOrdering {
 
-    static final Comparator<EventManager.Handler> HANDLER_ORDER = new Comparator<EventManager.Handler>() {
+    static final Comparator<Handler> HANDLER_ORDER = new Comparator<Handler>() {
         @Override
-        public int compare(EventManager.Handler left, EventManager.Handler right) {
+        public int compare(Handler left, Handler right) {
             int priorityCompare = Integer.compare(left.priority, right.priority);
             if (priorityCompare != 0) {
                 return priorityCompare;
@@ -26,18 +26,18 @@ final class HandlerOrdering {
     private HandlerOrdering() {
     }
 
-    static EventManager.Handler[] sortWithDag(List<EventManager.Handler> handlers) {
+    static Handler[] sortWithDag(List<Handler> handlers) {
         if (handlers == null || handlers.isEmpty()) {
-            return EventManager.NO_HANDLERS;
+            return Handler.NO_HANDLERS;
         }
         int n = handlers.size();
         if (n == 1) {
-            return handlers.toArray(EventManager.NO_HANDLERS);
+            return handlers.toArray(Handler.NO_HANDLERS);
         }
 
         boolean hasDag = false;
         for (int i = 0; i < n; i++) {
-            EventManager.Handler h = handlers.get(i);
+            Handler h = handlers.get(i);
             if ((h.id != null && !h.id.isEmpty())
                     || (h.after != null && h.after.length > 0)
                     || (h.before != null && h.before.length > 0)
@@ -50,7 +50,7 @@ final class HandlerOrdering {
 
         if (!hasDag) {
             handlers.sort(HANDLER_ORDER);
-            return handlers.toArray(EventManager.NO_HANDLERS);
+            return handlers.toArray(Handler.NO_HANDLERS);
         }
 
         List<List<Integer>> adj = new ArrayList<List<Integer>>(n);
@@ -60,11 +60,11 @@ final class HandlerOrdering {
         int[] inDegree = new int[n];
 
         for (int i = 0; i < n; i++) {
-            EventManager.Handler hi = handlers.get(i);
+            Handler hi = handlers.get(i);
             Class<?> ci = hi.getListenerClass();
             for (int j = 0; j < n; j++) {
                 if (i == j) continue;
-                EventManager.Handler hj = handlers.get(j);
+                Handler hj = handlers.get(j);
                 Class<?> cj = hj.getListenerClass();
 
                 boolean mustBeBefore = false;
@@ -112,7 +112,7 @@ final class HandlerOrdering {
             }
         }
 
-        final List<EventManager.Handler> handlerList = handlers;
+        final List<Handler> handlerList = handlers;
         java.util.PriorityQueue<Integer> pq = new java.util.PriorityQueue<Integer>(n, new Comparator<Integer>() {
             @Override
             public int compare(Integer a, Integer b) {
@@ -126,7 +126,7 @@ final class HandlerOrdering {
             }
         }
 
-        List<EventManager.Handler> result = new ArrayList<EventManager.Handler>(n);
+        List<Handler> result = new ArrayList<Handler>(n);
         while (!pq.isEmpty()) {
             int u = pq.poll();
             result.add(handlers.get(u));
@@ -143,10 +143,10 @@ final class HandlerOrdering {
             throw new CircularDependencyException("Circular dependency detected among event handlers: " + cyclePath, cyclePath);
         }
 
-        return result.toArray(EventManager.NO_HANDLERS);
+        return result.toArray(Handler.NO_HANDLERS);
     }
 
-    private static List<String> findCyclePath(List<EventManager.Handler> handlers, List<List<Integer>> adj, int[] inDegree) {
+    private static List<String> findCyclePath(List<Handler> handlers, List<List<Integer>> adj, int[] inDegree) {
         int n = handlers.size();
         boolean[] visited = new boolean[n];
         boolean[] onStack = new boolean[n];
@@ -158,7 +158,7 @@ final class HandlerOrdering {
                 if (cycle != null) {
                     List<String> path = new ArrayList<String>();
                     for (int node : cycle) {
-                        EventManager.Handler h = handlers.get(node);
+                        Handler h = handlers.get(node);
                         String name = (h.id != null && !h.id.isEmpty()) ? h.id :
                                 (h.getListenerClass() != null ? h.getListenerClass().getSimpleName() : "Handler@" + h.order);
                         path.add(name);

@@ -1,16 +1,10 @@
 package dev.hotaru.event.impl;
 
-public interface Stoppable {
+/**
+ * @deprecated Moved to {@link dev.hotaru.event.Stoppable}. This interface
+ * now extends it and remains only for source and binary compatibility.
+ */
+@Deprecated
+public interface Stoppable extends dev.hotaru.event.Stoppable {
 
-    boolean isStopped();
-
-    void setStopped(boolean state);
-
-    default void stop() {
-        setStopped(true);
-    }
-
-    default void resume() {
-        setStopped(false);
-    }
 }
