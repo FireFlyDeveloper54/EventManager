@@ -570,10 +570,6 @@ public final class SubscriberBuilder<T extends Event> {
             action = new Consumer<T>() {
                 @Override
                 public void accept(final T event) {
-                    ScheduledFuture<?> prevTask = debounceTask.get();
-                    if (prevTask != null) {
-                        prevTask.cancel(false);
-                    }
                     ScheduledFuture<?> nextTask = EventManager.getTimeoutScheduler().schedule(new Runnable() {
                         @Override
                         public void run() {
@@ -588,7 +584,14 @@ public final class SubscriberBuilder<T extends Event> {
                             }
                         }
                     }, delay, unit);
-                    debounceTask.set(nextTask);
+                    // Publish-then-cancel: the winner's task survives, every
+                    // loser's task is guaranteed to be cancelled. The old
+                    // get-cancel-schedule-set sequence could let two tasks
+                    // slip through under concurrent dispatch.
+                    ScheduledFuture<?> prevTask = debounceTask.getAndSet(nextTask);
+                    if (prevTask != null) {
+                        prevTask.cancel(false);
+                    }
                 }
             };
         }
