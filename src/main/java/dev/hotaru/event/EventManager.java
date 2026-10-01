@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -71,8 +72,11 @@ public class EventManager implements AutoCloseable {
             new ConcurrentHashMap<Class<? extends Event>, Handler[]>();
     private final ConcurrentMap<Class<?>, CachedDispatch> dispatchCache =
             new ConcurrentHashMap<Class<?>, CachedDispatch>();
-    private final ConcurrentMap<Class<?>, Long> typeMutationStamps =
-            new ConcurrentHashMap<Class<?>, Long>();
+    // Weak keys: mutation stamps are bookkeeping and must not keep event
+    // classes (or their class loaders) alive. Only independent get/put calls
+    // are made against this map, so the synchronized wrapper is sufficient.
+    private final Map<Class<?>, Long> typeMutationStamps =
+            Collections.synchronizedMap(new WeakHashMap<Class<?>, Long>());
     private static final ClassValue<Class<? extends Event>[]> EVENT_HIERARCHIES =
             new ClassValue<Class<? extends Event>[]>() {
                 @Override
@@ -101,8 +105,18 @@ public class EventManager implements AutoCloseable {
     private final ConcurrentMap<Class<? extends Event>, Event> stickyEvents =
             new ConcurrentHashMap<Class<? extends Event>, Event>();
 
-    private final ConcurrentMap<Class<?>, MetricCounter> metricsByType =
-            new ConcurrentHashMap<Class<?>, MetricCounter>();
+    // Weak keys so per-type metrics never pin an event class (or its class
+    // loader) after the type becomes unreachable. Compound check-then-act
+    // sequences synchronize on this map explicitly; see counterFor.
+    private final Map<Class<?>, MetricCounter> metricsByType =
+            Collections.synchronizedMap(new WeakHashMap<Class<?>, MetricCounter>());
+
+    // Drives the amortized auto-purge of garbage-collected weak handlers:
+    // set when a weak handler is registered, cleared by purgeDeadHandlers
+    // when a scan finds no weak handlers left at all.
+    private volatile boolean hasWeakHandlers = false;
+    // Counts dispatches towards the next opportunistic weak-handler purge.
+    private final AtomicLong dispatchesSinceWeakPurge = new AtomicLong();
 
 
     private volatile boolean metricsEnabled = true;
@@ -239,6 +253,7 @@ public class EventManager implements AutoCloseable {
         if (interceptor == null) {
             return;
         }
+        ensureOpen();
         this.interceptorList.add(interceptor);
         this.interceptor = EventInterceptors.chain(this.interceptorList);
     }
@@ -295,6 +310,20 @@ public class EventManager implements AutoCloseable {
 
     public boolean isClosed() {
         return closed;
+    }
+
+    /**
+     * Fails fast with {@link IllegalStateException} when this bus is closed.
+     * Every behavior-producing public entry point (dispatch, register, ...)
+     * calls this first so a closed bus never silently accepts new work.
+     * Cleanup and query operations (clear, unregister, metrics, ...) stay
+     * available on a closed bus and do not call this.
+     */
+    private void ensureOpen() {
+        if (closed) {
+            throw new IllegalStateException(
+                    "EventManager '" + name + "' is closed");
+        }
     }
 
     void setDeadEventsEnabled(boolean deadEventsEnabled) {
@@ -993,21 +1022,47 @@ public class EventManager implements AutoCloseable {
      */
     public int purgeDeadHandlers() {
         final AtomicInteger purged = new AtomicInteger();
+        final AtomicInteger weakFound = new AtomicInteger();
         for (Class<? extends Event> eventType : eventHandlers.keySet()) {
             removeHandlers(eventType, new Predicate<Handler>() {
                 @Override
                 public boolean test(Handler handler) {
-                    if (handler.isWeak() && handler.isDead()) {
-                        purged.incrementAndGet();
-                        return true;
+                    if (handler.isWeak()) {
+                        weakFound.incrementAndGet();
+                        if (handler.isDead()) {
+                            purged.incrementAndGet();
+                            return true;
+                        }
                     }
                     return false;
                 }
             });
         }
+        // Self-correct the fast-path flag: if no weak handlers remain at all,
+        // stop paying for the periodic scan until one is registered again.
+        if (weakFound.get() == 0) {
+            hasWeakHandlers = false;
+        }
         return purged.get();
     }
 
+    /**
+     * Opportunistically reaps garbage-collected weak handlers. The scan is
+     * amortized: it runs at most once per 1024 dispatches, and only when at
+     * least one weak handler was registered since the last scan found none.
+     */
+    private void maybePurgeDeadHandlers() {
+        if (hasWeakHandlers && (dispatchesSinceWeakPurge.incrementAndGet() & 1023) == 0) {
+            purgeDeadHandlers();
+        }
+    }
+
+    /**
+     * Clears all registrations and derived state: handlers, dispatch caches,
+     * mutation stamps, sticky events, upcasters, interceptors and metrics.
+     * Configuration (error handler, error policy, thread affinity, parent
+     * link) is left untouched. Safe to call repeatedly.
+     */
     public void clear() {
         boolean hadRegistrations = !eventHandlers.isEmpty() || !dispatchCache.isEmpty();
         for (Handler[] handlers : eventHandlers.values()) {
@@ -1017,6 +1072,15 @@ public class EventManager implements AutoCloseable {
         }
         eventHandlers.clear();
         dispatchCache.clear();
+        typeMutationStamps.clear();
+        upcasters.clear();
+        hasUpcasters = false;
+        stickyEvents.clear();
+        interceptorList.clear();
+        interceptor = null;
+        hasWeakHandlers = false;
+        dispatchesSinceWeakPurge.set(0);
+        resetMetrics();
         if (hadRegistrations) {
             mutationVersion.incrementAndGet();
         }
@@ -1189,9 +1253,10 @@ public class EventManager implements AutoCloseable {
      * @return the dispatched event, for chaining
      */
     public <T extends Event> T dispatch(T event) {
-        if (event == null || closed) {
-            return event;
+        if (event == null) {
+            return null;
         }
+        ensureOpen();
 
         EventTransactions.EventTransaction tx = EventTransactions.current();
         if (tx != null) {
@@ -1200,6 +1265,7 @@ public class EventManager implements AutoCloseable {
         }
 
         checkThreadAffinity(event);
+        maybePurgeDeadHandlers();
 
         long startNanos = metricsEnabled ? System.nanoTime() : 0L;
         if (metricsEnabled) {
@@ -1218,6 +1284,9 @@ public class EventManager implements AutoCloseable {
             }
             applyUpcasters(event, upcasterList);
             if (canBubbleToParent(event)) {
+                // Fail-fast: if the parent was closed concurrently, its
+                // dispatch throws IllegalStateException and the failure
+                // propagates to this dispatch's caller.
                 parent.dispatch(event);
             } else if (parent == null && deadEventsEnabled && !(event instanceof DeadEvent) && hasListeners(DeadEvent.class)) {
                 dispatch(new DeadEvent(this, event, EventTrace.capture()));
@@ -1291,9 +1360,10 @@ public class EventManager implements AutoCloseable {
     }
 
     public <T extends Event> T dispatchExact(T event) {
-        if (event == null || closed) {
-            return event;
+        if (event == null) {
+            return null;
         }
+        ensureOpen();
 
         EventTransactions.EventTransaction tx = EventTransactions.current();
         if (tx != null) {
@@ -1302,6 +1372,7 @@ public class EventManager implements AutoCloseable {
         }
 
         checkThreadAffinity(event);
+        maybePurgeDeadHandlers();
 
         long startNanos = metricsEnabled ? System.nanoTime() : 0L;
         if (metricsEnabled) {
@@ -1326,6 +1397,8 @@ public class EventManager implements AutoCloseable {
                 recordDuration(event.getClass(), System.nanoTime() - startNanos);
             }
             if (parent != null) {
+                // Fail-fast like dispatch(): a concurrently closed parent
+                // throws IllegalStateException here.
                 parent.dispatchExact(event);
             } else if (deadEventsEnabled && !(event instanceof DeadEvent) && hasListeners(DeadEvent.class)) {
                 dispatch(new DeadEvent(this, event, EventTrace.capture()));
@@ -1453,14 +1526,22 @@ public class EventManager implements AutoCloseable {
     }
 
     public <T extends Event> T dispatch(Class<T> eventType, Supplier<T> supplier) {
-        if (eventType == null || supplier == null || !hasListeners(eventType)) {
+        if (eventType == null || supplier == null) {
+            return null;
+        }
+        ensureOpen();
+        if (!hasListeners(eventType)) {
             return null;
         }
         return dispatch(supplier.get());
     }
 
     public <T extends Event> T dispatchExact(Class<T> eventType, Supplier<T> supplier) {
-        if (eventType == null || supplier == null || !hasExactListeners(eventType)) {
+        if (eventType == null || supplier == null) {
+            return null;
+        }
+        ensureOpen();
+        if (!hasExactListeners(eventType)) {
             return null;
         }
         return dispatchExact(supplier.get());
@@ -1669,6 +1750,29 @@ public class EventManager implements AutoCloseable {
         return policy == ErrorPolicy.CONTINUE;
     }
 
+    /**
+     * Reports a {@link Throwable} that escaped {@link #dispatch} on a background
+     * worker thread (for example {@link AsyncEventChannel}'s dispatcher) to the
+     * configured {@link EventErrorHandler}. The error policy is deliberately
+     * <em>not</em> applied here: propagating would kill the worker thread, so
+     * the worker always continues with the next event. This method never throws.
+     *
+     * <p>Note: listener failures are already reported to the error handler by
+     * dispatch itself, so under {@link ErrorPolicy#PROPAGATE} or
+     * {@link ErrorPolicy#AGGREGATE} the same failure may be reported twice —
+     * once per listener, once at this worker boundary with a {@code null}
+     * listener. Failures that dispatch never saw (such as a throwing
+     * interceptor) are reported exactly once here.
+     */
+    void reportAsyncFailure(Event event, Throwable throwable) {
+        try {
+            errorHandler.handle(event, null, throwable);
+        } catch (Throwable errorHandlerFailure) {
+            log.log(Level.SEVERE, "Event error handler threw while handling an async dispatch failure",
+                    errorHandlerFailure);
+        }
+    }
+
     private EventDispatchException buildAggregatedException(Event event, List<Throwable> errors) {
         Throwable primary = errors.get(0);
         String eventName = event == null ? "null" : event.getClass().getName();
@@ -1687,13 +1791,18 @@ public class EventManager implements AutoCloseable {
         if (eventType == null) {
             return null;
         }
-        MetricCounter counter = metricsByType.get(eventType);
-        if (counter == null) {
-            MetricCounter created = new MetricCounter();
-            MetricCounter previous = metricsByType.putIfAbsent(eventType, created);
-            counter = previous != null ? previous : created;
+        // The check-then-act sequence must be atomic: the synchronized map
+        // wrapper alone does not make putIfAbsent atomic, so two racing
+        // threads could otherwise create and publish two counters for the
+        // same type and lose increments.
+        synchronized (metricsByType) {
+            MetricCounter counter = metricsByType.get(eventType);
+            if (counter == null) {
+                counter = new MetricCounter();
+                metricsByType.put(eventType, counter);
+            }
+            return counter;
         }
-        return counter;
     }
 
     private void recordDispatch(Class<?> eventType) {
@@ -2041,6 +2150,15 @@ public class EventManager implements AutoCloseable {
     }
 
     private void addHandler(final Handler handler) {
+        // Single choke point for every public register* variant and the
+        // on()/subscribe()/expect() builder paths: registering on a closed
+        // bus is a programming error, fail fast.
+        ensureOpen();
+        if (handler.isWeak()) {
+            // Publish the flag before the handler becomes visible so a racing
+            // opportunistic purge is less likely to miss it.
+            hasWeakHandlers = true;
+        }
         boolean added = false;
         while (true) {
             Handler[] existing = eventHandlers.get(handler.eventType);
@@ -2575,6 +2693,7 @@ public class EventManager implements AutoCloseable {
      * @param action the transactional block
      */
     public void transaction(Runnable action) {
+        ensureOpen();
         EventTransactions.execute(this, action);
     }
 
@@ -2586,6 +2705,7 @@ public class EventManager implements AutoCloseable {
      * @return the result of the action
      */
     public <R> R transaction(Supplier<R> action) {
+        ensureOpen();
         return EventTransactions.execute(this, action);
     }
 
@@ -2598,6 +2718,7 @@ public class EventManager implements AutoCloseable {
      * @param action transactional logic
      */
     public void transaction(final Consumer<TransactionContext> action) {
+        ensureOpen();
         EventTransactions.executeWithContext(this, action);
     }
 
@@ -2894,6 +3015,7 @@ public class EventManager implements AutoCloseable {
         if (event == null) {
             return null;
         }
+        ensureOpen();
         EventTransactions.EventTransaction tx = EventTransactions.current();
         if (tx != null) {
             // Buffer the sticky write together with the dispatch: on rollback
@@ -2940,6 +3062,7 @@ public class EventManager implements AutoCloseable {
      */
     public <S, T> void registerUpcaster(EventUpcaster.Typed<S, T> upcaster) {
         Objects.requireNonNull(upcaster, "upcaster");
+        ensureOpen();
         Class<?> source = upcaster.getSourceType();
         Class<?> target = upcaster.getTargetType();
         if (source != null && target != null && reachesUpcasterTarget(target, source)) {
