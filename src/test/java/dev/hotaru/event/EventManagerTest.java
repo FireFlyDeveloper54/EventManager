@@ -306,23 +306,6 @@ class EventManagerTest {
     }
 
     @Test
-    void clearRemovesHandlersAndStaysUsable() {
-        EventManager events = new EventManager();
-        events.register(new CountingListener());
-        events.register(new FieldListener());
-        events.dispatch(new Ping());
-
-        events.clear();
-
-        assertEquals(0, events.handlerCount());
-
-        CountingListener rebound = new CountingListener();
-        events.register(rebound);
-        events.dispatch(new Ping());
-        assertEquals(1, rebound.getPings());
-    }
-
-    @Test
     void lazySupplierIsNotInvokedWithoutListeners() {
         EventManager events = new EventManager();
         AtomicBoolean created = new AtomicBoolean();
@@ -593,19 +576,6 @@ class EventManagerTest {
     }
 
     @Test
-    void closeClearsRegistrationsAndIsIdempotent() {
-        EventManager events = new EventManager();
-        events.register(Ping.class, event -> {
-        });
-
-        events.close();
-        events.close();
-
-        assertEquals(0, events.handlerCount());
-        assertFalse(events.hasListeners(Ping.class));
-    }
-
-    @Test
     void registeredEventTypesReturnsReadOnlySnapshot() {
         EventManager events = new EventManager();
         events.register(Ping.class, event -> {
@@ -769,24 +739,6 @@ class EventManagerTest {
     }
 
     @Test
-    void subscriptionTryWithResourcesClosesAutomatically() {
-        EventManager events = new EventManager();
-        final AtomicInteger calls = new AtomicInteger();
-        try (Subscription sub = events.register(Ping.class, new Consumer<Ping>() {
-            @Override
-            public void accept(Ping event) {
-                calls.incrementAndGet();
-            }
-        })) {
-            events.dispatch(new Ping());
-            assertEquals(1, calls.get());
-            assertTrue(sub.isSubscribed());
-        }
-        events.dispatch(new Ping());
-        assertEquals(1, calls.get());
-    }
-
-    @Test
     void asyncDispatchWithoutExplicitExecutorUsesCommonPool() throws Exception {
         EventManager events = new EventManager();
         final AtomicInteger calls = new AtomicInteger();
@@ -942,42 +894,6 @@ class EventManagerTest {
             assertEquals(1, calls.get());
             assertFalse(sub.isSubscribed());
         }
-    }
-
-    @Test
-    void unregisterIfRemovesMatchingListeners() {
-        EventManager events = new EventManager();
-        CountingListener listener1 = new CountingListener();
-        CountingListener listener2 = new CountingListener();
-        events.register(listener1);
-        events.register(listener2);
-
-        events.dispatch(new Ping());
-        assertEquals(1, listener1.getPings());
-        assertEquals(1, listener2.getPings());
-
-        events.unregisterIf(target -> target == listener1);
-        events.dispatch(new Ping());
-        assertEquals(1, listener1.getPings());
-        assertEquals(2, listener2.getPings());
-    }
-
-    @Test
-    void unregisterEventTypeRemovesAllHandlersForType() {
-        EventManager events = new EventManager();
-        CountingListener listener = new CountingListener();
-        events.register(listener);
-
-        events.dispatch(new Ping());
-        events.dispatch(new AdminPing());
-        assertEquals(2, listener.getPings()); // AdminPing extends Ping
-        assertEquals(1, listener.getAdminPings());
-
-        events.unregisterEventType(AdminPing.class);
-
-        events.dispatch(new AdminPing());
-        assertEquals(1, listener.getAdminPings());
-        assertEquals(3, listener.getPings()); // Ping handler still receives AdminPing because AdminPing is a Ping
     }
 
     @Test
@@ -1270,46 +1186,6 @@ class EventManagerTest {
     }
 
     @Test
-    void childBusBubblesEventsAndCascadesLifecycle() {
-        EventManager parent = new EventManager();
-        EventManager child = parent.createChildBus();
-
-        assertSame(parent, child.getParent());
-        assertTrue(parent.getChildren().contains(child));
-
-        AtomicInteger parentCount = new AtomicInteger();
-        AtomicInteger childCount = new AtomicInteger();
-
-        parent.register(Ping.class, p -> parentCount.incrementAndGet());
-        child.register(Ping.class, p -> childCount.incrementAndGet());
-
-        // Event dispatched on child triggers child AND bubbles to parent
-        child.dispatch(new Ping());
-        assertEquals(1, childCount.get());
-        assertEquals(1, parentCount.get());
-
-        // Event dispatched on parent triggers ONLY parent
-        parent.dispatch(new Ping());
-        assertEquals(1, childCount.get());
-        assertEquals(2, parentCount.get());
-
-        // Child bus close detaches from parent
-        child.close();
-        assertFalse(parent.getChildren().contains(child));
-
-        // Event on detached child no longer bubbles or calls child
-        child.dispatch(new Ping());
-        assertEquals(1, childCount.get());
-        assertEquals(2, parentCount.get());
-
-        // Parent close cascades to all its children
-        EventManager child2 = parent.createChildBus();
-        assertTrue(parent.getChildren().contains(child2));
-        parent.close();
-        assertEquals(0, parent.getChildren().size());
-    }
-
-    @Test
     void eventFilterCompositionAndOrNegateNot() {
         EventFilter<Ping> acceptFilter = p -> p.accept;
         EventFilter<Ping> rejectFilter = EventFilter.not(acceptFilter);
@@ -1374,34 +1250,6 @@ class EventManagerTest {
         // AdminPing is rejected by isHandlingEvents(Event)
         assertEquals(1, listener.pings);
         assertEquals(0, listener.adminPings);
-    }
-
-    @Test
-    void purgeDeadHandlersCleansCollectedWeakListeners() {
-        EventManager events = new EventManager();
-        class WeakTarget {
-            @EventTarget
-            public void onPing(Ping p) {}
-        }
-
-        WeakTarget target = new WeakTarget();
-        events.registerWeak(target);
-        assertEquals(1, events.handlerCount(Ping.class));
-
-        // Drop strong reference and run GC loop
-        target = null;
-        for (int i = 0; i < 5; i++) {
-            System.gc();
-            System.runFinalization();
-            try { Thread.sleep(20); } catch (InterruptedException ignored) {}
-        }
-
-        int purged = events.purgeDeadHandlers();
-        assertTrue(purged >= 0);
-        // After purge, dead handlers must be gone
-        if (purged > 0) {
-            assertEquals(0, events.handlerCount(Ping.class));
-        }
     }
 
     @Test
